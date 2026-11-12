@@ -53,6 +53,19 @@ the two-node launcher.
 
 ## Measured results
 
+### SGLang end-to-end (8×L4)
+
+Experimental BF16 AG/RS/AR drop-in on 8×NVIDIA L4 with GLM-4.5-Air-FP8
+and SGLang TP8/DP8/EP8. For 64 requests of 256 input and 32 output tokens
+(32 running maximum), three-run median whole-batch latency was **14.72 s
+with UCCL Lite vs 15.84 s with NCCL: 7.1% lower**. This fixed packet
+configuration includes queueing in the measured time.
+
+![SGLang whole-batch latency, UCCL Lite versus NCCL](docs/assets/sglang-e2e-latency-8l4.svg)
+
+[Full measurements](../../integration/nccl_lite/README.md) include a real
+112-request trace whose final completion was 3.3% slower with UCCL Lite.
+
 ### Single-node collectives
 
 #### AllReduce on single 4xL4 GPU

@@ -7,7 +7,7 @@ requests, 256 input and 32 output tokens each; 32 running requests maximum.
 Three-run median whole-batch latency: **UCCL-Lite 14.72 s vs NCCL 15.84 s
 (7.1% lower)**. This workload includes queueing.
 
-![Whole-batch latency bar chart](best_e2e_latency.svg)
+![Whole-batch latency bar chart](../../experimental/lite/docs/assets/sglang-e2e-latency-8l4.svg)
 
 This is an experimental **single-node, eight-process, BF16** NCCL compatibility
 layer for AllGather, ReduceScatter(SUM), and AllReduce(SUM). It forwards other
