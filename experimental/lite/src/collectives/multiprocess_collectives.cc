@@ -37,6 +37,7 @@ struct alignas(64) Shared {
   std::atomic<int> failed;
   std::atomic<int> openedCount;
   std::atomic<uint64_t> arrived[kMaxRanks];
+  std::atomic<uint64_t> reduced[kMaxRanks];
   std::atomic<uint64_t> finished[kMaxRanks];
   int operation[kMaxRanks];
   size_t count[kMaxRanks];
@@ -137,7 +138,7 @@ void CUDART_CB route(void* opaque) {
       size_t bytes = call->count * sizeof(uint16_t);
       for (int r = 0; r < h->ranks; ++r)
         std::memcpy(h->ownOutput + size_t(r) * bytes, h->input(r), bytes);
-    } else {
+    } else if (call->operation == 2) {
       auto* out = reinterpret_cast<uint16_t*>(h->ownOutput);
       for (size_t i = 0; i < call->count; ++i) {
         float sum = 0;
@@ -146,6 +147,31 @@ void CUDART_CB route(void* opaque) {
           sum += bf16ToFloat(in[size_t(h->rank) * call->count + i]);
         }
         out[i] = floatToBf16(sum);
+      }
+    } else {
+      // Each rank reduces a different range. Its source range remains in its
+      // own output buffer while peers copy it, so no extra staging is needed.
+      size_t begin = call->count * size_t(h->rank) / size_t(h->ranks);
+      size_t end = call->count * size_t(h->rank + 1) / size_t(h->ranks);
+      auto* out = reinterpret_cast<uint16_t*>(h->ownOutput);
+      for (size_t i = begin; i < end; ++i) {
+        float sum = 0;
+        for (int r = 0; r < h->ranks; ++r) {
+          auto* in = reinterpret_cast<const uint16_t*>(h->input(r));
+          sum += bf16ToFloat(in[i]);
+        }
+        out[i] = floatToBf16(sum);
+      }
+      s->reduced[h->rank].store(call->sequence, std::memory_order_release);
+      for (int r = 0; r < h->ranks; ++r)
+        waitFor(s->reduced[r], call->sequence, s);
+      for (int r = 0; r < h->ranks; ++r) {
+        if (r == h->rank) continue;
+        size_t sourceBegin = call->count * size_t(r) / size_t(h->ranks);
+        size_t sourceEnd = call->count * size_t(r + 1) / size_t(h->ranks);
+        size_t offset = sourceBegin * sizeof(uint16_t);
+        size_t bytes = (sourceEnd - sourceBegin) * sizeof(uint16_t);
+        std::memcpy(h->ownOutput + offset, h->output(r) + offset, bytes);
       }
     }
     s->finished[h->rank].store(call->sequence, std::memory_order_release);
@@ -240,7 +266,8 @@ extern "C" int uccl_lite_mp_enqueue(void* handle, int operation,
                                      size_t count, void* stream) {
   try {
     auto* h = static_cast<Handle*>(handle);
-    if (!h || !input || !output || (operation != 1 && operation != 2) ||
+    if (!h || !input || !output ||
+        (operation != 1 && operation != 2 && operation != 3) ||
         count > SIZE_MAX / (sizeof(uint16_t) * size_t(h->ranks)))
       throw std::invalid_argument("invalid collective call");
     size_t inputBytes = count * sizeof(uint16_t) *

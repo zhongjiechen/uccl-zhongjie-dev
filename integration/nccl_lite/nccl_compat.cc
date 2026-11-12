@@ -50,13 +50,15 @@ struct State {
   std::mutex lock;
   uint64_t agCalls = 0;
   uint64_t rsCalls = 0;
+  uint64_t arCalls = 0;
   ~State() {
     if (collective) {
       uccl_lite_mp_destroy(collective);
       std::fprintf(stderr,
-                   "UCCL Lite NCCL proxy: rank=%d completed AG=%llu RS=%llu\n",
+                   "UCCL Lite NCCL proxy: rank=%d completed AG=%llu RS=%llu AR=%llu\n",
                    rank, static_cast<unsigned long long>(agCalls),
-                   static_cast<unsigned long long>(rsCalls));
+                   static_cast<unsigned long long>(rsCalls),
+                   static_cast<unsigned long long>(arCalls));
     }
   }
 };
@@ -104,16 +106,22 @@ size_t maxBytes() {
   if (!end || *end || !parsed || parsed > (1ULL << 30)) return 0;
   return static_cast<size_t>(parsed);
 }
+const char* operationName(int operation) {
+  return operation == 1 ? "AG" : operation == 2 ? "RS" : "AR";
+}
 ncclResult_t dispatch(int operation, const void* send, void* recv, size_t count,
                       ncclDataType_t dtype, ncclRedOp_t reduction,
                       ncclComm_t comm, cudaStream_t stream) {
   auto s = stateFor(comm);
   size_t capacity = maxBytes();
-  size_t bytes = count * sizeof(uint16_t);
   if (!enabled() || !s || groupDepth || s->ranks != 8 ||
-      dtype != ncclBfloat16 || (operation == 2 && reduction != ncclSum) ||
-      !capacity || count > SIZE_MAX / (sizeof(uint16_t) * 8) ||
-      bytes * size_t(s->ranks) > capacity || !send || !recv)
+      dtype != ncclBfloat16 ||
+      (operation != 1 && operation != 2 && operation != 3) ||
+      (operation != 1 && reduction != ncclSum) || !capacity ||
+      count > capacity /
+                  (sizeof(uint16_t) *
+                   (operation == 3 ? 1 : size_t(s->ranks))) ||
+      !send || !recv)
     return ncclInvalidUsage;
   std::lock_guard<std::mutex> guard(s->lock);
   if (!s->collective) {
@@ -131,19 +139,22 @@ ncclResult_t dispatch(int operation, const void* send, void* recv, size_t count,
                  uccl_lite_mp_last_error());
     return ncclSystemError;
   }
-  uint64_t calls = operation == 1 ? ++s->agCalls : ++s->rsCalls;
+  uint64_t calls = operation == 1   ? ++s->agCalls
+                   : operation == 2 ? ++s->rsCalls
+                                    : ++s->arCalls;
   if (calls == 1)
     std::fprintf(stderr, "UCCL Lite NCCL proxy: rank=%d op=%s BF16 count=%zu\n",
-                 s->rank, operation == 1 ? "AG" : "RS", count);
+                 s->rank, operationName(operation), count);
   const char* trace = std::getenv("UCCL_LITE_NCCL_TRACE");
   if (s->rank == 0 && trace && std::strcmp(trace, "1") == 0)
     std::fprintf(stderr,
                  "UCCL Lite NCCL proxy TRACE rank=0 op=%s calls=%llu "
-                 "ag_calls=%llu rs_calls=%llu count=%zu comm=%s\n",
-                 operation == 1 ? "AG" : "RS",
+                 "ag_calls=%llu rs_calls=%llu ar_calls=%llu count=%zu comm=%s\n",
+                 operationName(operation),
                  static_cast<unsigned long long>(calls),
                  static_cast<unsigned long long>(s->agCalls),
-                 static_cast<unsigned long long>(s->rsCalls), count,
+                 static_cast<unsigned long long>(s->rsCalls),
+                 static_cast<unsigned long long>(s->arCalls), count,
                  s->id.c_str());
   return ncclSuccess;
 }
@@ -208,8 +219,14 @@ ncclResult_t ncclReduceScatter(const void* send, void* recv, size_t count,
 ncclResult_t ncclAllReduce(const void* send, void* recv, size_t count,
                            ncclDataType_t dtype, ncclRedOp_t op,
                            ncclComm_t comm, cudaStream_t stream) {
-  return real<decltype(&ncclAllReduce)>("ncclAllReduce")(
-      send, recv, count, dtype, op, comm, stream);
+  auto s = stateFor(comm);
+  size_t capacity = maxBytes();
+  if (!enabled() || !s || groupDepth || s->ranks != 8 ||
+      dtype != ncclBfloat16 || op != ncclSum || !capacity ||
+      count > capacity / sizeof(uint16_t))
+    return real<decltype(&ncclAllReduce)>("ncclAllReduce")(
+        send, recv, count, dtype, op, comm, stream);
+  return dispatch(3, send, recv, count, dtype, op, comm, stream);
 }
 ncclResult_t ncclReduce(const void* send, void* recv, size_t count,
                         ncclDataType_t dtype, ncclRedOp_t op, int root,

@@ -82,6 +82,42 @@ void rankRun(int rank, ncclUniqueId id) {
       }
     check(cudaFree(input));
     check(cudaFree(output));
+
+    hostInput.resize(count);
+    for (size_t i = 0; i < count; ++i)
+      hostInput[i] = bf16(float(rank + 1 + i % 4));
+    hostOutput.assign(count, 0);
+    check(cudaMalloc(&input, count * 2));
+    check(cudaMalloc(&output, count * 2));
+    check(cudaMemcpyAsync(input, hostInput.data(), count * 2,
+                          cudaMemcpyHostToDevice, stream));
+    check(ncclAllReduce(input, output, count, ncclBfloat16, ncclSum, comm,
+                        stream));
+    check(cudaMemcpyAsync(hostOutput.data(), output, count * 2,
+                          cudaMemcpyDeviceToHost, stream));
+    check(cudaStreamSynchronize(stream));
+    for (size_t i = 0; i < count; ++i)
+      if (hostOutput[i] != bf16(float(36 + 8 * (i % 4)))) {
+        std::fprintf(stderr, "AR mismatch rank=%d count=%zu i=%zu\n", rank,
+                     count, i);
+        std::exit(6);
+      }
+
+    check(cudaMemcpyAsync(input, hostInput.data(), count * 2,
+                          cudaMemcpyHostToDevice, stream));
+    check(ncclAllReduce(input, input, count, ncclBfloat16, ncclSum, comm,
+                        stream));
+    check(cudaMemcpyAsync(hostOutput.data(), input, count * 2,
+                          cudaMemcpyDeviceToHost, stream));
+    check(cudaStreamSynchronize(stream));
+    for (size_t i = 0; i < count; ++i)
+      if (hostOutput[i] != bf16(float(36 + 8 * (i % 4)))) {
+        std::fprintf(stderr, "in-place AR mismatch rank=%d count=%zu i=%zu\n",
+                     rank, count, i);
+        std::exit(7);
+      }
+    check(cudaFree(input));
+    check(cudaFree(output));
   }
   check(cudaStreamDestroy(stream));
   check(ncclCommDestroy(comm));
@@ -112,7 +148,7 @@ int main() {
       passed = false;
     }
   }
-  std::puts(passed ? "UCCL Lite NCCL AG/RS 8-process check passed" :
-                     "UCCL Lite NCCL AG/RS 8-process check failed");
+  std::puts(passed ? "UCCL Lite NCCL AG/RS/AR 8-process check passed" :
+                     "UCCL Lite NCCL AG/RS/AR 8-process check failed");
   return passed ? 0 : 1;
 }
