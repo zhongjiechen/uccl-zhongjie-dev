@@ -33,7 +33,8 @@ void rankRun(int rank, ncclUniqueId id) {
   check(ncclCommInitRank(&comm, 8, id, rank));
   cudaStream_t stream;
   check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  for (size_t count : {size_t(8), size_t(1009), size_t(16384), size_t(131072)}) {
+  for (size_t count :
+       {size_t(8), size_t(128), size_t(1009), size_t(16384), size_t(131072)}) {
     std::vector<uint16_t> hostInput(count);
     for (size_t i = 0; i < count; ++i)
       hostInput[i] = bf16(float(rank + 1 + i % 4));
@@ -118,6 +119,80 @@ void rankRun(int rank, ncclUniqueId id) {
       }
     check(cudaFree(input));
     check(cudaFree(output));
+  }
+  // Queue mixed collectives before synchronizing. Input and result packet
+  // credits must preserve every prior generation across operation changes.
+  constexpr int burst = 9;
+  void* burstInput[burst]{};
+  void* burstOutput[burst]{};
+  for (int step = 0; step < burst; ++step) {
+    int operation = step % 3;
+    size_t agCount = step == 3 ? size_t(2097152) : size_t(262144);
+    size_t rsCount = step == 4   ? size_t(1048576)
+                     : step == 7 ? size_t(128)
+                                 : size_t(262144);
+    size_t arCount = step == 5 ? size_t(8388608) : size_t(524288);
+    size_t count = operation == 0   ? agCount
+                   : operation == 1 ? rsCount * 8
+                                    : arCount;
+    size_t outputCount = operation == 0   ? agCount * 8
+                         : operation == 1 ? rsCount
+                                          : arCount;
+    std::vector<uint16_t> values(count, bf16(float(rank + 1 + step)));
+    if (operation == 1)
+      for (int destination = 0; destination < 8; ++destination)
+        for (size_t i = 0; i < rsCount; ++i)
+          values[size_t(destination) * rsCount + i] =
+              bf16(float(rank + 1 + step + destination * 8));
+    check(cudaMalloc(&burstInput[step], count * 2));
+    check(cudaMalloc(&burstOutput[step], outputCount * 2));
+    check(cudaMemcpyAsync(burstInput[step], values.data(), count * 2,
+                          cudaMemcpyHostToDevice, stream));
+    check(cudaStreamSynchronize(stream));
+  }
+  for (int step = 0; step < burst; ++step) {
+    size_t agCount = step == 3 ? size_t(2097152) : size_t(262144);
+    size_t rsCount = step == 4   ? size_t(1048576)
+                     : step == 7 ? size_t(128)
+                                 : size_t(262144);
+    size_t arCount = step == 5 ? size_t(8388608) : size_t(524288);
+    if (step % 3 == 0)
+      check(ncclAllGather(burstInput[step], burstOutput[step], agCount,
+                          ncclBfloat16, comm, stream));
+    else if (step % 3 == 1)
+      check(ncclReduceScatter(burstInput[step], burstOutput[step], rsCount,
+                              ncclBfloat16, ncclSum, comm, stream));
+    else
+      check(ncclAllReduce(burstInput[step], burstOutput[step], arCount,
+                          ncclBfloat16, ncclSum, comm, stream));
+  }
+  check(cudaStreamSynchronize(stream));
+  for (int step = 0; step < burst; ++step) {
+    int operation = step % 3;
+    size_t agCount = step == 3 ? size_t(2097152) : size_t(262144);
+    size_t rsCount = step == 4   ? size_t(1048576)
+                     : step == 7 ? size_t(128)
+                                 : size_t(262144);
+    size_t arCount = step == 5 ? size_t(8388608) : size_t(524288);
+    size_t count = operation == 0   ? agCount * 8
+                   : operation == 1 ? rsCount
+                                    : arCount;
+    std::vector<uint16_t> actual(count);
+    check(cudaMemcpy(actual.data(), burstOutput[step], count * 2,
+                     cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; ++i) {
+      int source = operation == 0 ? int(i / agCount) : -1;
+      float expected = operation == 0   ? float(source + 1 + step)
+                       : operation == 1 ? float(36 + 8 * step + rank * 64)
+                                        : float(36 + 8 * step);
+      if (actual[i] != bf16(expected)) {
+        std::fprintf(stderr, "async burst mismatch rank=%d step=%d i=%zu\n",
+                     rank, step, i);
+        std::exit(8);
+      }
+    }
+    check(cudaFree(burstInput[step]));
+    check(cudaFree(burstOutput[step]));
   }
   check(cudaStreamDestroy(stream));
   check(ncclCommDestroy(comm));
