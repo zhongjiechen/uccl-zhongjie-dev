@@ -1,5 +1,14 @@
 # UCCL Lite NCCL AG/RS/AR compatibility layer
 
+## Best end-to-end result
+
+GLM-4.5-Air-FP8 on 8×NVIDIA L4, SGLang TP8/DP8/EP8. Workload: 64 concurrent
+requests, 256 input and 32 output tokens each; 32 running requests maximum.
+Three-run median whole-batch latency: **UCCL-Lite 14.72 s vs NCCL 15.84 s
+(7.1% lower)**. This workload includes queueing.
+
+![Whole-batch latency bar chart](best_e2e_latency.svg)
+
 This is an experimental **single-node, eight-process, BF16** NCCL compatibility
 layer for AllGather, ReduceScatter(SUM), and AllReduce(SUM). It forwards other
 NCCL calls used by the installed SGLang PyNccl wrapper to the real NCCL
@@ -59,6 +68,89 @@ performance equivalence on other hosts, CUDA versions, or call patterns.
 The [48-point CSV](perf_8l4_20261112.csv) contains every measured size.
 Both curves use one fixed size-adaptive configuration, rather than selecting
 the best separately measured variant at each point.
+
+### Additional end-to-end workloads (2026-11-12)
+
+The same GLM-4.5-Air-FP8 TP8/DP8/EP8 server was measured with longer prompts
+and responses. Each case is `requests:input tokens:output tokens`; each value
+is the median of three completed runs. The client submits all requests
+concurrently to `/generate` and records streaming token timestamps. Both
+backends use the same prompts, `mem_fraction_static=0.93`, eager execution,
+disabled radix cache, `max_running_requests=32`, and the same CPU affinity.
+For NCCL, the same compatibility library is loaded with
+`UCCL_LITE_NCCL_ENABLE=0`. An 8-request warmup was run after each server start.
+
+| Requests:input:output | Last TTFT packet / NCCL | Batch-tail TPOT packet / NCCL | Whole batch packet / NCCL | Whole-batch gain |
+| --- | ---: | ---: | ---: | ---: |
+| 32:128:128 | 1.450 / 1.657 s | 149.5 / 152.0 ms | 20.429 / 20.960 s | 2.5% |
+| 16:512:64 | 2.654 / 3.118 s | 152.0 / 151.5 ms | 12.238 / 12.670 s | 3.4% |
+| 32:512:64 | 5.072 / 6.050 s | 153.3 / 151.5 ms | 14.752 / 15.592 s | 5.4% |
+| 8:64:256 | 0.475 / 0.476 s | 146.5 / 149.3 ms | 37.825 / 38.546 s | 1.9% |
+| 32:64:256 | 0.854 / 0.944 s | 152.5 / 154.1 ms | 39.743 / 40.226 s | 1.2% |
+| 64:256:32 | 9.977 / 11.028 s | 152.0 / 155.4 ms | 14.722 / 15.843 s | 7.1% |
+
+The 64-request case includes queueing because the server allows at most 32
+running requests. It is an overload comparison, not a pure collective-latency
+measurement. The prompts are synthetic incident-summary text repeated to reach
+the requested lengths, so these results establish performance for the listed
+shapes, not for a production prompt distribution. The two 512-token input
+cases have slightly better batch-tail TPOT with NCCL even though packet mode
+has lower TTFT and whole-batch time. The [raw 36-run CSV](e2e_workloads_20261112.csv)
+and [client](bench_e2e_workloads.py) are provided for reproduction. `batch_tail_tpot_ms`
+is `(last completion - last first token) / (output tokens - 1)`; the CSV also
+contains median per-request TTFT and TPOT.
+
+### BurstGPT trace replay (2026-11-12)
+
+We replayed three 60-second windows from the public
+[BurstGPT_1.csv trace](https://github.com/HPMLL/BurstGPT/blob/main/data/BurstGPT_1.csv).
+The windows are identified by `floor(Timestamp / 60)` in that file. We kept
+every successful ChatGPT request in each selected window, preserving the
+original second-level arrival time and request/response token counts. No
+time scaling, token clipping, or request subsampling was applied within a
+window. All selected requests fit the configured 4096-token context.
+
+BurstGPT does not publish prompt content. For this replay, we used human
+messages from the first 10 MiB of the public
+[ShareGPT file](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/blob/main/ShareGPT_V3_unfiltered_cleaned_split.json),
+tokenized them with the GLM tokenizer, and selected a sufficiently long
+message for each request before trimming it to the trace's exact input token
+count. Thus arrival times and lengths come from the real trace, and prompt
+texts are real but come from a separate corpus. Original BurstGPT prompt
+content and its correlation with length or arrival time cannot be recovered.
+
+The server used the same GLM-4.5-Air-FP8 TP8/DP8/EP8 eager configuration,
+`mem_fraction_static=0.93`, disabled radix cache, and at most 32 running
+requests. Both backends loaded the same proxy; NCCL used
+`UCCL_LITE_NCCL_ENABLE=0`. Each backend received an 8-request warmup after
+startup. The table is the median of three full replays per window. TTFT,
+TPOT, and E2E are request-level metrics; makespan is time from the window's
+start until its final request finishes.
+
+| Window; requests; median input/output | p50 TTFT packet / NCCL | p95 TTFT packet / NCCL | p50 TPOT packet / NCCL | p50 E2E packet / NCCL | Makespan packet / NCCL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 9242; 50; 508/45 | 0.648 / 0.638 s | 0.831 / 0.831 s | 152.4 / 152.7 ms | 7.440 / 7.529 s | 66.22 / 66.30 s |
+| 14622; 112; 112/125 | 4.342 / 4.682 s | 13.419 / 13.929 s | 154.2 / 155.4 ms | 23.708 / 24.005 s | 97.05 / 93.91 s |
+| 16738; 31; 1580/108 | 1.530 / 1.625 s | 2.137 / 2.309 s | 178.2 / 185.0 ms | 20.637 / 21.779 s | 104.24 / 106.00 s |
+
+The 50-request window is effectively tied. In the 112-request burst,
+packet mode improves p50 TTFT by 7.3% and p50 E2E by 1.2%, while NCCL
+finishes the final request 3.3% sooner. In the 31-request long-input
+window, packet mode improves p50 TTFT by 5.9%, p50 TPOT by 3.7%, and p50
+E2E by 5.2%. The replay client's maximum dispatch lag was below 4 ms in
+all runs. The [selected trace rows](burstgpt_windows_20261112.tsv),
+[18-run result file](burstgpt_trace_results_20261112.tsv), and
+[replay client](bench_burstgpt_trace.py) retain the underlying measurements.
+
+To reproduce the prompt corpus prefix, fetch bytes `0-10485759` from the
+linked ShareGPT JSON file. SHA-256 of that prefix is
+`d714b39acc25514875b65866e6ba91750518c75926f16502a74f9e62b7202c48`.
+SHA-256 of `BurstGPT_1.csv` used here is
+`46fc9480ef0b748ecb2b51d512ff08c196b031782cbe6f78e28044d768e86d5a`.
+The first two windows were replayed in one client invocation, and window
+16738 in a separate invocation, with `--minutes 16738`. Use the same two
+invocations for each backend; the deterministic prompt selection depends on
+the order of windows in an invocation.
 
 ## Build and checks
 
