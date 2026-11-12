@@ -19,6 +19,15 @@ UCCL is an efficient communication library for GPUs, covering collectives, P2P (
 * **Flexibility** for high performance in fast-evolving ML workloads
 * **Portability** for connecting heterogeneous GPUs in ML workloads
 
+### UCCL-Lite SGLang end-to-end result
+
+GLM-4.5-Air-FP8 on 8×NVIDIA L4, SGLang TP8/DP8/EP8. With 64 concurrent requests
+(256 input, 32 output tokens each; 32 running maximum), three-run median
+whole-batch latency was **14.72 s with UCCL-Lite vs 15.84 s with NCCL**:
+**7.1% lower**. This workload includes queueing. [Full results](integration/nccl_lite/README.md).
+
+![Whole-batch latency: UCCL-Lite vs NCCL](integration/nccl_lite/best_e2e_latency.svg)
+
 An UCCL overview can be found in this [slide deck](https://docs.google.com/presentation/d/1LQxZzxghRmua4FkfQjWu69wXy9hrs9V_tXrXt_DT-F4/edit?usp=sharing) with the following components: 
 
 * **[UCCL-collective](collective/)** (UCCL-Tran) serves as a drop-in replacement for NCCL/RCCL (e.g., requiring no changes to application code), and significantly outperforms them in both latency and throughput across various settings. 
