@@ -58,6 +58,14 @@ per-communicator cumulative counters. Record the counters after server warmup,
 send one request batch at a time, and compare the counters after each response.
 Tracing adds logging overhead, so disable it for latency measurements.
 
+On Linux, `UCCL_LITE_MP_CALLBACK_CPUS=5,11,17,23,29,35,41,47` optionally
+maps CUDA device indices 0 through 7 to one CPU each for the host callback.
+It is unset by default. The callback changes only its own thread's affinity;
+application scheduler threads need a separate affinity setting. On the tested
+eight-L4 host, SGLang's `SGLANG_SET_CPU_AFFINITY=1` improved this proxy's
+large-batch latency, while reserving one physical core per callback made it
+slower. Keep callback pinning opt-in and measure it with the target workload.
+
 In the validated eager SGLang setup, DP attention padding depends on the
 active batch. Request-level tracing confirmed AG/RS during both prefill and
 decode at batch size 8; smaller batches can take a different path. Check

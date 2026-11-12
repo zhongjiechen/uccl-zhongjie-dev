@@ -2,11 +2,13 @@
 
 #include <cuda_runtime_api.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -113,6 +115,35 @@ uint16_t floatToBf16(float value) {
   return uint16_t(bits >> 16);
 }
 
+void bindCallbackCpu(int device) {
+  const char* mapping = std::getenv("UCCL_LITE_MP_CALLBACK_CPUS");
+  if (!mapping || !*mapping) return;
+  thread_local int boundDevice = -1;
+  thread_local int boundCpu = -1;
+  if (boundDevice == device && sched_getcpu() == boundCpu) return;
+
+  const char* cursor = mapping;
+  long cpu = -1;
+  for (int i = 0; i <= device; ++i) {
+    char* end = nullptr;
+    cpu = std::strtol(cursor, &end, 10);
+    if (end == cursor || cpu < 0 || cpu >= CPU_SETSIZE ||
+        (i < device && *end != ',') ||
+        (i == device && *end != '\0' && *end != ','))
+      throw std::invalid_argument("invalid UCCL_LITE_MP_CALLBACK_CPUS");
+    cursor = end + 1;
+  }
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  if (sched_setaffinity(0, sizeof(set), &set) != 0)
+    throw std::runtime_error(std::string("callback CPU affinity: ") +
+                             std::strerror(errno));
+  boundDevice = device;
+  boundCpu = static_cast<int>(cpu);
+  std::fprintf(stderr, "UCCL Lite callback device=%d CPU=%ld\n", device, cpu);
+}
+
 struct Call {
   Handle* handle;
   uint64_t sequence;
@@ -124,6 +155,7 @@ void CUDART_CB route(void* opaque) {
   std::unique_ptr<Call> call(static_cast<Call*>(opaque));
   auto* h = call->handle;
   try {
+    bindCallbackCpu(h->device);
     Shared* s = h->shared;
     s->operation[h->rank] = call->operation;
     s->count[h->rank] = call->count;
