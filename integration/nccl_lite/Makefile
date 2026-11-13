@@ -7,7 +7,7 @@ TORCHRUN ?= torchrun
 BUILD := build
 LITE := ../../experimental/lite
 
-.PHONY: all check check-torch check-shared-packet clean
+.PHONY: all check check-torch check-shared-packet check-sum2 check-ag-gemm check-ready-rs bench-sum2 clean
 all: $(BUILD)/libuccl_lite_nccl_compat.so
 
 check: $(BUILD)/test_compat
@@ -19,6 +19,18 @@ check-torch: $(BUILD)/libuccl_lite_nccl_compat.so
 check-shared-packet: $(BUILD)/test_shared_packet
 	./$(BUILD)/test_shared_packet
 
+check-sum2: $(BUILD)/test_rs_sum2
+	UCCL_LITE_REAL_NCCL=$(REAL_NCCL) ./run_packet_8l4.sh ./$(BUILD)/test_rs_sum2
+
+check-ag-gemm: $(BUILD)/test_ag_gemm
+	UCCL_LITE_REAL_NCCL=$(REAL_NCCL) ./run_packet_8l4.sh ./$(BUILD)/test_ag_gemm
+
+check-ready-rs: $(BUILD)/test_rs_ready
+	UCCL_LITE_REAL_NCCL=$(REAL_NCCL) ./run_packet_8l4.sh timeout 30 ./$(BUILD)/test_rs_ready
+
+bench-sum2: $(BUILD)/bench_rs_sum2
+	UCCL_LITE_REAL_NCCL=$(REAL_NCCL) ./run_packet_8l4.sh ./$(BUILD)/bench_rs_sum2
+
 $(BUILD):
 	mkdir -p $@
 
@@ -29,10 +41,22 @@ $(BUILD)/multiprocess_packet_ag.o: $(LITE)/src/collectives/multiprocess_packet_a
 	$(NVCC) -O3 -std=c++17 -Xcompiler=-fPIC -gencode=arch=compute_89,code=sm_89 -I$(LITE)/include -c $< -o $@
 
 $(BUILD)/libuccl_lite_nccl_compat.so: nccl_compat.cc $(LITE)/src/collectives/multiprocess_collectives.cc $(LITE)/include/uccl_lite/multiprocess_collectives.h $(LITE)/src/cpu_router/cpu_executor.cc $(LITE)/include/uccl_lite/cpu_router/cpu_executor.hpp $(BUILD)/multiprocess_packet_ag.o | $(BUILD)
-	$(CXX) -O3 -std=c++17 -fPIC -shared -pthread -I$(LITE)/include -I$(LITE)/include/uccl_lite/cpu_router -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include nccl_compat.cc $(LITE)/src/collectives/multiprocess_collectives.cc $(LITE)/src/cpu_router/cpu_executor.cc $(BUILD)/multiprocess_packet_ag.o -L$(CUDA_HOME)/lib64 -lcudart -ldl -Wl,-rpath,$(CUDA_HOME)/lib64 -o $@
+	$(CXX) -O3 -std=c++17 -fPIC -shared -pthread -I$(LITE)/include -I$(LITE)/include/uccl_lite/cpu_router -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include nccl_compat.cc $(LITE)/src/collectives/multiprocess_collectives.cc $(LITE)/src/cpu_router/cpu_executor.cc $(BUILD)/multiprocess_packet_ag.o -L$(CUDA_HOME)/lib64 -lcudart -lcublas -ldl -Wl,-rpath,$(CUDA_HOME)/lib64 -o $@
 
 $(BUILD)/test_compat: test_compat.cc $(BUILD)/libuccl_lite_nccl_compat.so
 	$(CXX) -O2 -std=c++17 -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include $< -L$(BUILD) -luccl_lite_nccl_compat -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(abspath $(BUILD)) -Wl,-rpath,$(CUDA_HOME)/lib64 -o $@
+
+$(BUILD)/test_rs_sum2: test_rs_sum2.cc nccl_fusion.h $(BUILD)/libuccl_lite_nccl_compat.so
+	$(CXX) -O2 -std=c++17 -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include $< -L$(BUILD) -luccl_lite_nccl_compat -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(abspath $(BUILD)) -Wl,-rpath,$(CUDA_HOME)/lib64 -o $@
+
+$(BUILD)/test_ag_gemm: test_ag_gemm.cc nccl_fusion.h $(BUILD)/libuccl_lite_nccl_compat.so
+	$(CXX) -O2 -std=c++17 -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include $< -L$(BUILD) -luccl_lite_nccl_compat -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Wl,-rpath,$(abspath $(BUILD)) -Wl,-rpath,$(CUDA_HOME)/lib64 -o $@
+
+$(BUILD)/bench_rs_sum2: bench_rs_sum2.cu nccl_fusion.h $(BUILD)/libuccl_lite_nccl_compat.so
+	$(NVCC) -O2 -std=c++17 -gencode=arch=compute_89,code=sm_89 -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include $< -L$(BUILD) -luccl_lite_nccl_compat -L$(CUDA_HOME)/lib64 -lcudart -Xlinker=-rpath,$(abspath $(BUILD)) -o $@
+
+$(BUILD)/test_rs_ready: test_rs_ready.cu $(LITE)/include/uccl_lite/multiprocess_collectives.h $(BUILD)/libuccl_lite_nccl_compat.so
+	$(NVCC) -O2 -std=c++17 -gencode=arch=compute_89,code=sm_89 -I$(LITE)/include -I$(CUDA_HOME)/include $< -L$(BUILD) -luccl_lite_nccl_compat -L$(CUDA_HOME)/lib64 -lcudart -Xlinker=-rpath,$(abspath $(BUILD)) -o $@
 
 clean:
 	rm -rf $(BUILD)

@@ -65,6 +65,31 @@ configuration includes queueing in the measured time.
 
 [Full measurements](../../integration/nccl_lite/README.md) include a real
 112-request trace whose final completion was 3.3% slower with UCCL Lite.
+An [opt-in SGLang MoE epilogue plus RS experiment](../../integration/nccl_lite/fusion_rs_8l4_20261112.md)
+also shows small end-to-end gains against the packet proxy on two separate
+workloads. Its effective running-request limit was four, so those timings
+should not be combined with the 32-running-request result above.
+The subsequent [AG+gate GEMM and RS SGLang experiment](../../integration/nccl_lite/fusion_ag_rs_8l4_20261112.md)
+reports a 3.0% whole-batch gain for one short workload with a numerically
+matching AG/cuBLAS path. A separate 256-output-token decode-heavy batch
+showed a 2.9%–3.9% gain against before/after packet controls; the measured
+32- and 64-request workloads were tied or slower.
+An [opt-in row-ready MoE combine plus RS integration](../../integration/nccl_lite/fusion_ready_rs_8l4_20261112.md)
+reduced a separate 8-request, 256-output-token whole batch by 4.7%–5.6%
+versus before/after packet controls on its initial source revision. A later
+current-source comparison showed only a 1.0% reduction, so the larger gain
+remains historical. In a further same-source retest, the long-output batch
+was 2.4% lower than packet, while a short-output batch was tied. It schedules
+RS on a separate stream
+against per-row combine readiness; the FP8 down GEMM still completes before
+combine begins. A direct GPU overlap timeline was not captured.
+The subsequent [FP8 down GEMM readiness prototype](../../integration/nccl_lite/fusion_down_gemm_rs_8l4_20261112.md)
+passed decode-shape checks but showed no incremental end-to-end gain; it
+remains opt-in.
+The [safe AG+gate and ready RS combined run](../../integration/nccl_lite/fusion_ag_rs_8l4_20261112.md#safe-aggate-with-row-ready-rs)
+reached 2.543/36.349 s versus 2.694/37.354 s for packet on 8-request
+16/256-output-token batches (5.6%/2.7% lower). Its gain over ready RS alone
+on the longer batch was only 0.3% in this sequential test.
 
 ### Single-node collectives
 

@@ -42,6 +42,12 @@ cudaError_t launchAgPacket(PacketShared* mapped, uint16_t* agInput,
                            int rank, uint64_t baseGeneration,
                            uint64_t previousSlot0, uint64_t previousSlot1,
                            cudaStream_t stream);
+// Small BF16 AG+GEMM: each rank contributes one 4096-element row; every rank
+// receives eight rows and computes A[8,4096] x B[128,4096]^T -> C[8,128].
+cudaError_t launchAgGemm128x4096Packet(
+    PacketShared* mapped, uint16_t* agInput, void const* input, void* gathered,
+    void const* weight, void* logits, int rank, uint64_t baseGeneration,
+    uint64_t previousSlot0, cudaStream_t stream);
 cudaError_t launchAgPacketPipelined(PacketShared* mapped, uint16_t* agInput,
                                     CrewState* crews, void const* input,
                                     void* output, size_t count, int rank,
@@ -53,6 +59,20 @@ cudaError_t launchRsPacket(PacketShared* mapped, void const* input,
                            void* output, size_t shardCount, int rank,
                            uint64_t baseGeneration, uint64_t previousSlot0,
                            uint64_t previousSlot1, cudaStream_t stream);
+// Add two BF16 GEMM/epilogue outputs with BF16 rounding while uploading the
+// ReduceScatter packet. The local shard is retained on its GPU and added with
+// the same BF16 rounding during reduction.
+cudaError_t launchRsSum2Packet(PacketShared* mapped, void const* input,
+                               void const* auxiliary, void* output,
+                               size_t shardCount, int rank,
+                               uint64_t baseGeneration, uint64_t previousSlot0,
+                               uint64_t previousSlot1, cudaStream_t stream);
+// Dedicated-stream, one-row-per-rank RS. A local producer publishes one
+// system-scope readiness flag per 4096-element destination row.
+cudaError_t launchRsReadySum2Packet(
+    PacketShared* mapped, void const* input, void const* auxiliary,
+    void* output, uint32_t const* ready, int rank, uint64_t baseGeneration,
+    uint64_t previousSlot0, cudaStream_t stream);
 cudaError_t launchRsPacketPipelined(PacketShared* mapped, CrewState* crews,
                                     void const* input, void* output,
                                     size_t shardCount, int rank,

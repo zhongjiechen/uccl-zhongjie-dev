@@ -2,6 +2,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 namespace uccl_lite::multiprocess {
 namespace {
@@ -35,6 +36,15 @@ __device__ uint64_t acquireGpu(uint64_t const* address) {
 __device__ uint32_t acquireGpu(uint32_t const* address) {
   uint32_t value;
   asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+               : "=r"(value)
+               : "l"(address)
+               : "memory");
+  return value;
+}
+
+__device__ uint32_t acquireReady(uint32_t const* address) {
+  uint32_t value;
+  asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
                : "=r"(value)
                : "l"(address)
                : "memory");
@@ -118,8 +128,49 @@ __device__ void uploadRsStripe(uint16_t* packet, uint16_t const* input,
   }
 }
 
+__device__ void uploadRsSum2Stripe(uint16_t* packet, uint16_t const* input,
+                                   uint16_t const* auxiliary,
+                                   size_t shardCount, size_t begin,
+                                   size_t length, int rank, size_t lane,
+                                   size_t stride) {
+  bool vector = ((reinterpret_cast<uintptr_t>(input) |
+                  reinterpret_cast<uintptr_t>(auxiliary) |
+                  reinterpret_cast<uintptr_t>(packet)) &
+                 15) == 0 &&
+                shardCount % 8 == 0 && length % 8 == 0;
+  if (vector) {
+    size_t vectorsPerStripe = length / 8;
+    for (size_t flat = lane; flat < size_t(kPacketRanks) * vectorsPerStripe;
+         flat += stride) {
+      size_t destination = flat / vectorsPerStripe;
+      if (destination == size_t(rank)) continue;
+      size_t index = flat % vectorsPerStripe;
+      size_t offset = destination * shardCount + begin + index * 8;
+      size_t packetOffset = destination * kRsStripeElements + index * 8;
+      uint4 first = *reinterpret_cast<uint4 const*>(input + offset);
+      uint4 second = *reinterpret_cast<uint4 const*>(auxiliary + offset);
+      *reinterpret_cast<uint4*>(packet + packetOffset) = make_uint4(
+          addRetainedPair(first.x, second.x),
+          addRetainedPair(first.y, second.y),
+          addRetainedPair(first.z, second.z),
+          addRetainedPair(first.w, second.w));
+    }
+    return;
+  }
+  for (size_t flat = lane; flat < size_t(kPacketRanks) * length;
+       flat += stride) {
+    size_t destination = flat / length;
+    if (destination == size_t(rank)) continue;
+    size_t index = flat % length;
+    size_t sourceOffset = destination * shardCount + begin + index;
+    packet[destination * kRsStripeElements + index] =
+        addRetained(input[sourceOffset], auxiliary[sourceOffset]);
+  }
+}
+
 __device__ uint4 sumRsPacked(PacketShared const* shared, int slot,
-                             uint16_t const* own, size_t offset, int rank) {
+                             uint16_t const* own, size_t offset, int rank,
+                             uint16_t const* ownAux = nullptr) {
   float sum[8] = {};
 #pragma unroll
   for (int peer = 0; peer < kPacketRanks; ++peer) {
@@ -128,6 +179,13 @@ __device__ uint4 sumRsPacked(PacketShared const* shared, int slot,
                      : shared->input[slot][peer] +
                            size_t(rank) * kRsStripeElements + offset;
     uint4 words = *reinterpret_cast<uint4 const*>(source);
+    if (peer == rank && ownAux) {
+      uint4 second = *reinterpret_cast<uint4 const*>(ownAux + offset);
+      words = make_uint4(addRetainedPair(words.x, second.x),
+                         addRetainedPair(words.y, second.y),
+                         addRetainedPair(words.z, second.z),
+                         addRetainedPair(words.w, second.w));
+    }
     uint32_t packed[4] = {words.x, words.y, words.z, words.w};
 #pragma unroll
     for (int part = 0; part < 4; ++part) {
@@ -239,6 +297,65 @@ __global__ void allGatherPacket(PacketShared* shared, uint16_t* agInput,
     grid.sync();
     if (lane == 0) publish(&shared->consumed[slot][rank], generation);
     grid.sync();
+  }
+}
+
+__global__ void allGatherGemm128x4096Packet(
+    PacketShared* shared, uint16_t* agInput, uint16_t const* input,
+    uint16_t* gathered, uint16_t const* weight, uint16_t* logits, int rank,
+    uint64_t base, uint64_t prior0) {
+  auto grid = cg::this_grid();
+  size_t lane = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = size_t(gridDim.x) * blockDim.x;
+  uint64_t generation = base + 1;
+  if (lane == 0 && prior0)
+    for (int peer = 0; peer < kPacketRanks; ++peer)
+      while (acquire(&shared->consumed[0][peer]) < prior0) __nanosleep(64);
+  grid.sync();
+
+  uint16_t* packet = agInput + size_t(rank) * kAgPacketElements;
+  for (size_t i = lane; i < 4096 / 8; i += stride)
+    reinterpret_cast<uint4*>(packet)[i] =
+        reinterpret_cast<uint4 const*>(input)[i];
+  grid.sync();
+  if (lane == 0) publish(&shared->uploaded[0][rank], generation);
+  if (lane == 0)
+    for (int peer = 0; peer < kPacketRanks; ++peer)
+      while (acquire(&shared->uploaded[0][peer]) < generation) __nanosleep(64);
+  grid.sync();
+
+  for (size_t flat = lane; flat < size_t(kPacketRanks) * 4096 / 8;
+       flat += stride) {
+    int peer = int(flat / (4096 / 8));
+    size_t index = flat % (4096 / 8);
+    uint16_t const* source =
+        peer == rank ? input : agInput + size_t(peer) * kAgPacketElements;
+    reinterpret_cast<uint4*>(gathered + size_t(peer) * 4096)[index] =
+        reinterpret_cast<uint4 const*>(source)[index];
+  }
+  grid.sync();
+  if (lane == 0) publish(&shared->consumed[0][rank], generation);
+  grid.sync();
+
+  // Eight warps per CTA. Each warp computes four BF16 gate logits with FP32
+  // accumulation; the packet kernel and GEMM share one cooperative launch.
+  int warp = int(blockIdx.x) * 8 + int(threadIdx.x) / 32;
+  int warpLane = int(threadIdx.x) % 32;
+  for (int output = warp; output < 8 * 128; output += 32 * 8) {
+    int row = output / 128;
+    int column = output % 128;
+    float sum = 0.f;
+    for (int k = warpLane; k < 4096; k += 32) {
+      float a = __uint_as_float(uint32_t(gathered[size_t(row) * 4096 + k])
+                                << 16);
+      float b = __uint_as_float(uint32_t(weight[size_t(column) * 4096 + k])
+                                << 16);
+      sum = fmaf(a, b, sum);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+      sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (warpLane == 0)
+      logits[output] = __bfloat16_as_ushort(__float2bfloat16_rn(sum));
   }
 }
 
@@ -392,6 +509,110 @@ __global__ void reduceScatterPacket(PacketShared* shared, uint16_t const* input,
     grid.sync();
     if (lane == 0) publish(&shared->consumed[slot][rank], generation);
     grid.sync();
+  }
+}
+
+__global__ void reduceScatterSum2Packet(
+    PacketShared* shared, uint16_t const* input, uint16_t const* auxiliary,
+    uint16_t* output, size_t shardCount, int rank, uint64_t base,
+    uint64_t prior0, uint64_t prior1) {
+  auto grid = cg::this_grid();
+  size_t lane = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = size_t(gridDim.x) * blockDim.x;
+  size_t tiles = (shardCount + kRsStripeElements - 1) / kRsStripeElements;
+  for (size_t tile = 0; tile < tiles; ++tile) {
+    int slot = int(tile & 1);
+    uint64_t previous = tile >= 2 ? base + tile - 1 : slot ? prior1 : prior0;
+    uint64_t generation = base + tile + 1;
+    if (lane == 0 && previous)
+      for (int peer = 0; peer < kPacketRanks; ++peer)
+        while (acquire(&shared->consumed[slot][peer]) < previous)
+          __nanosleep(64);
+    grid.sync();
+
+    size_t begin = tile * kRsStripeElements;
+    size_t length = min(kRsStripeElements, shardCount - begin);
+    uploadRsSum2Stripe(shared->input[slot][rank], input, auxiliary, shardCount,
+                       begin, length, rank, lane, stride);
+    grid.sync();
+    if (lane == 0) publish(&shared->uploaded[slot][rank], generation);
+    if (lane == 0)
+      for (int peer = 0; peer < kPacketRanks; ++peer)
+        while (acquire(&shared->uploaded[slot][peer]) < generation)
+          __nanosleep(64);
+    grid.sync();
+
+    uint16_t const* own = input + size_t(rank) * shardCount + begin;
+    uint16_t const* ownAux = auxiliary + size_t(rank) * shardCount + begin;
+    uint16_t* target = output + begin;
+    for (size_t i = lane; i < length / 8; i += stride)
+      reinterpret_cast<uint4*>(target)[i] =
+          sumRsPacked(shared, slot, own, i * 8, rank, ownAux);
+    for (size_t i = length / 8 * 8 + lane; i < length; i += stride) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int peer = 0; peer < kPacketRanks; ++peer)
+        sum += __uint_as_float(uint32_t(
+                                   peer == rank
+                                       ? addRetained(own[i], ownAux[i])
+                                       : shared->input[slot][peer]
+                                                      [size_t(rank) *
+                                                           kRsStripeElements +
+                                                       i])
+                               << 16);
+      target[i] = __bfloat16_as_ushort(__float2bfloat16_rn(sum));
+    }
+    grid.sync();
+    if (lane == 0) publish(&shared->consumed[slot][rank], generation);
+    grid.sync();
+  }
+}
+
+__global__ void reduceScatterReadySum2Packet(
+    PacketShared* shared, uint16_t const* input, uint16_t const* auxiliary,
+    uint16_t* output, uint32_t const* ready, int rank, uint64_t base,
+    uint64_t prior0) {
+  int destination = int(blockIdx.x);
+  int lane = int(threadIdx.x);
+  uint64_t generation = base + 1;
+  if (lane == 0 && prior0)
+    for (int peer = 0; peer < kPacketRanks; ++peer)
+      while (acquire(&shared->consumed[0][peer]) < prior0) __nanosleep(64);
+  __syncthreads();
+
+  if (lane == 0)
+    while (acquireReady(ready + destination) < 1) __nanosleep(64);
+  __syncthreads();
+  if (destination != rank) {
+    uint16_t const* first = input + size_t(destination) * 4096;
+    uint16_t const* second = auxiliary + size_t(destination) * 4096;
+    uint16_t* packet =
+        shared->input[0][rank] + size_t(destination) * kRsStripeElements;
+    for (int i = lane; i < 4096 / 8; i += blockDim.x) {
+      uint4 a = reinterpret_cast<uint4 const*>(first)[i];
+      uint4 b = reinterpret_cast<uint4 const*>(second)[i];
+      reinterpret_cast<uint4*>(packet)[i] =
+          make_uint4(addRetainedPair(a.x, b.x), addRetainedPair(a.y, b.y),
+                     addRetainedPair(a.z, b.z), addRetainedPair(a.w, b.w));
+    }
+  }
+  __syncthreads();
+  if (lane == 0)
+    publish(&shared->uploadedDest[0][rank][destination], generation);
+
+  if (destination == rank) {
+    if (lane == 0)
+      for (int peer = 0; peer < kPacketRanks; ++peer)
+        while (acquire(&shared->uploadedDest[0][peer][rank]) < generation)
+          __nanosleep(64);
+    __syncthreads();
+    uint16_t const* own = input + size_t(rank) * 4096;
+    uint16_t const* ownAux = auxiliary + size_t(rank) * 4096;
+    for (int i = lane; i < 4096 / 8; i += blockDim.x)
+      reinterpret_cast<uint4*>(output)[i] =
+          sumRsPacked(shared, 0, own, size_t(i) * 8, rank, ownAux);
+    __syncthreads();
+    if (lane == 0) publish(&shared->consumed[0][rank], generation);
   }
 }
 
@@ -748,6 +969,22 @@ cudaError_t launchAgPacket(PacketShared* mapped, uint16_t* agInput,
                                      dim3(32), dim3(256), args, 0, stream);
 }
 
+cudaError_t launchAgGemm128x4096Packet(
+    PacketShared* mapped, uint16_t* agInput, void const* input, void* gathered,
+    void const* weight, void* logits, int rank, uint64_t baseGeneration,
+    uint64_t previousSlot0, cudaStream_t stream) {
+  uint16_t const* source = static_cast<uint16_t const*>(input);
+  uint16_t* gatheredRows = static_cast<uint16_t*>(gathered);
+  uint16_t const* gateWeight = static_cast<uint16_t const*>(weight);
+  uint16_t* gateLogits = static_cast<uint16_t*>(logits);
+  void* args[] = {&mapped,      &agInput,       &source, &gatheredRows,
+                  &gateWeight,  &gateLogits,    &rank,   &baseGeneration,
+                  &previousSlot0};
+  return cudaLaunchCooperativeKernel(
+      reinterpret_cast<void*>(allGatherGemm128x4096Packet), dim3(32),
+      dim3(256), args, 0, stream);
+}
+
 cudaError_t launchAgPacketPipelined(
     PacketShared* mapped, uint16_t* agInput, CrewState* crews,
     void const* input, void* output, size_t count, int rank,
@@ -774,6 +1011,46 @@ cudaError_t launchRsPacket(PacketShared* mapped, void const* input,
   return cudaLaunchCooperativeKernel(
       reinterpret_cast<void*>(reduceScatterPacket), dim3(32), dim3(256), args,
       0, stream);
+}
+
+cudaError_t launchRsSum2Packet(PacketShared* mapped, void const* input,
+                               void const* auxiliary, void* output,
+                               size_t shardCount, int rank,
+                               uint64_t baseGeneration, uint64_t previousSlot0,
+                               uint64_t previousSlot1, cudaStream_t stream) {
+  uint16_t const* source = static_cast<uint16_t const*>(input);
+  uint16_t const* second = static_cast<uint16_t const*>(auxiliary);
+  uint16_t* destination = static_cast<uint16_t*>(output);
+  void* args[] = {&mapped, &source,         &second,        &destination,
+                  &shardCount, &rank,       &baseGeneration, &previousSlot0,
+                  &previousSlot1};
+  static int configuredBlocks = [] {
+    char const* value = std::getenv("UCCL_LITE_RS_SUM2_BLOCKS");
+    if (!value) return 32;
+    int blocks = std::atoi(value);
+    return blocks == 8 || blocks == 16 || blocks == 24 || blocks == 32
+               ? blocks
+               : 32;
+  }();
+  int blocks = shardCount == 4096 ? configuredBlocks : 32;
+  return cudaLaunchCooperativeKernel(
+      reinterpret_cast<void*>(reduceScatterSum2Packet), dim3(blocks), dim3(256),
+      args, 0, stream);
+}
+
+cudaError_t launchRsReadySum2Packet(
+    PacketShared* mapped, void const* input, void const* auxiliary,
+    void* output, uint32_t const* ready, int rank, uint64_t baseGeneration,
+    uint64_t previousSlot0, cudaStream_t stream) {
+  uint16_t const* source = static_cast<uint16_t const*>(input);
+  uint16_t const* second = static_cast<uint16_t const*>(auxiliary);
+  uint16_t* destination = static_cast<uint16_t*>(output);
+  void* args[] = {&mapped,      &source,         &second,      &destination,
+                  &ready,       &rank,           &baseGeneration,
+                  &previousSlot0};
+  return cudaLaunchKernel(
+      reinterpret_cast<void*>(reduceScatterReadySum2Packet), dim3(8),
+      dim3(256), args, 0, stream);
 }
 
 cudaError_t launchRsPacketPipelined(

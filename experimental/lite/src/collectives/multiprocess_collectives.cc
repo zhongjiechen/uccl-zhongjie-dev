@@ -117,6 +117,7 @@ struct Handle {
   uint64_t nextSequence = 1;
   uint64_t lastDirectSequence = 0;
   cudaStream_t lastStream = nullptr;
+  bool readyOnly = false;
   bool directAllGather = false;
   bool directAllReduce = false;
   bool packetAllGather = false;
@@ -966,7 +967,7 @@ void CUDART_CB route(void* opaque) {
 }
 
 std::unique_ptr<Handle> create(char const* identifier, int ranks, int rank,
-                               size_t maxBytes) {
+                               size_t maxBytes, bool readyOnly) {
   if (!identifier || !*identifier || ranks < 2 || ranks > kMaxRanks ||
       rank < 0 || rank >= ranks || maxBytes == 0)
     throw std::invalid_argument("invalid collective configuration");
@@ -974,6 +975,7 @@ std::unique_ptr<Handle> create(char const* identifier, int ranks, int rank,
   h->name = std::string("/uccl-lite-mp-") + identifier;
   h->rank = rank;
   h->ranks = ranks;
+  h->readyOnly = readyOnly;
   check(cudaGetDevice(&h->device));
   h->maxBytes = alignPage(maxBytes);
   char const* packetAg = std::getenv("UCCL_LITE_MP_PACKET_AG");
@@ -1029,6 +1031,21 @@ std::unique_ptr<Handle> create(char const* identifier, int ranks, int rank,
       throw std::invalid_argument("invalid small RS GPU size");
     h->smallRsGpuMaxBytes = size_t(parsed);
   }
+  if (readyOnly) {
+    if (ranks != 8 || maxBytes != 65536)
+      throw std::invalid_argument("ready RS requires eight ranks and 64 KiB");
+    h->packetAllGather = false;
+    h->pipelinedAllGather = false;
+    h->packetReduceScatter = true;
+    h->pipelinedReduceScatter = false;
+    h->cpuReduceScatter = false;
+    h->retainOwnReduceScatter = false;
+    h->destReadyReduceScatter = false;
+    h->hostGateReduceScatter = false;
+    h->packetAllReduce = false;
+    h->smallArGpuMaxBytes = 0;
+    h->smallRsGpuMaxBytes = 65536;
+  }
   h->parallelAllReduce =
       h->packetAllReduce && parallelAr && std::strcmp(parallelAr, "1") == 0;
   h->isolatePacketWorker = (h->cpuReduceScatter || h->packetAllReduce) &&
@@ -1063,7 +1080,9 @@ std::unique_ptr<Handle> create(char const* identifier, int ranks, int rank,
     throw std::invalid_argument("hierarchical split credits require scratch");
   if (h->retainOwnReduceScatter && h->destReadyReduceScatter)
     throw std::invalid_argument("retained RS requires flat packet routing");
-  if (rank == 0)
+  if (rank == 0 && readyOnly)
+    std::fprintf(stderr, "UCCL Lite packet mode: GPU-only ready RS\n");
+  else if (rank == 0)
     std::fprintf(stderr,
                  "UCCL Lite packet mode AG=%d RS=%d AR=%d retain_rs=%d "
                  "split_credits=%d scratch=%d pipeline_ag=%d hier_rs=%d\n",
@@ -1243,7 +1262,7 @@ std::unique_ptr<Handle> create(char const* identifier, int ranks, int rank,
     isolatePacketWorker(h.get(), worker);
   }
   char const* direct = std::getenv("UCCL_LITE_MP_DIRECT_AG");
-  h->directAllGather = direct && std::strcmp(direct, "1") == 0;
+  h->directAllGather = !readyOnly && direct && std::strcmp(direct, "1") == 0;
   if (h->directAllGather) {
     for (int peer = 0; peer < ranks; ++peer) {
       if (peer == rank) continue;
@@ -1253,7 +1272,7 @@ std::unique_ptr<Handle> create(char const* identifier, int ranks, int rank,
     }
   }
   char const* directAr = std::getenv("UCCL_LITE_MP_DIRECT_AR");
-  if (directAr && std::strcmp(directAr, "1") == 0) {
+  if (!readyOnly && directAr && std::strcmp(directAr, "1") == 0) {
     for (int peer = 0; peer < ranks; ++peer) {
       if (peer == rank) continue;
       char* address = h->output(peer);
@@ -1272,15 +1291,24 @@ std::unique_ptr<Handle> create(char const* identifier, int ranks, int rank,
 extern "C" void* uccl_lite_mp_create(char const* identifier, int ranks,
                                      int rank, size_t max_bytes) {
   try {
-    return create(identifier, ranks, rank, max_bytes).release();
+    return create(identifier, ranks, rank, max_bytes, false).release();
   } catch (std::exception const& e) {
     lastError = e.what();
     return nullptr;
   }
 }
-extern "C" int uccl_lite_mp_enqueue(void* handle, int operation,
-                                    void const* input, void* output,
-                                    size_t count, void* stream) {
+extern "C" void* uccl_lite_mp_create_rs_ready(char const* identifier,
+                                                int ranks, int rank) {
+  try {
+    return create(identifier, ranks, rank, 65536, true).release();
+  } catch (std::exception const& e) {
+    lastError = e.what();
+    return nullptr;
+  }
+}
+static int enqueueImpl(void* handle, int operation, void const* input,
+                       void const* auxiliary, void* output, void* gemmOutput,
+                       uint32_t const* ready, size_t count, void* stream) {
   try {
     auto* h = static_cast<Handle*>(handle);
     if (!h || !input || !output ||
@@ -1293,6 +1321,19 @@ extern "C" int uccl_lite_mp_enqueue(void* handle, int operation,
                          (operation == 1 ? size_t(h->ranks) : 1);
     if (inputBytes > h->maxBytes || outputBytes > h->maxBytes)
       throw std::invalid_argument("collective exceeds prepared capacity");
+    bool sum2GpuRs = operation == 2 && h->packetReduceScatter &&
+                     (h->readyOnly || h->cpuReduceScatter) &&
+                     !h->pipelinedReduceScatter &&
+                     h->smallRsGpuMaxBytes && inputBytes >= 2048 &&
+                     inputBytes <= h->smallRsGpuMaxBytes;
+    bool agGemm = operation == 1 && gemmOutput;
+    if (agGemm && (count != 4096 || !auxiliary || !h->packetAllGather))
+      throw std::invalid_argument("AG+GEMM requires 4096-element packet AG");
+    if (auxiliary && !sum2GpuRs && !agGemm)
+      throw std::invalid_argument("unsupported fused collective input");
+    if (ready && (!sum2GpuRs || count != 4096 || !auxiliary ||
+                  h->hostGateReduceScatter))
+      throw std::invalid_argument("ready RS requires 4096-element GPU packet");
     auto cudaStream = static_cast<cudaStream_t>(stream);
     // Subsequent calls on this communicator must use the same stream. This
     // preserves ordering of the single shared staging slot.
@@ -1337,7 +1378,11 @@ extern "C" int uccl_lite_mp_enqueue(void* handle, int operation,
         bool pipelineAg = operation == 1 && h->pipelinedAllGather &&
                           outputBytes >= (512UL << 10);
         if (operation == 1) {
-          if (pipelineAg)
+          if (agGemm)
+            check(uccl_lite::multiprocess::launchAgGemm128x4096Packet(
+                mapped, h->agDevice, input, output, auxiliary, gemmOutput,
+                h->rank, base, h->lastPacketGeneration[0], cudaStream));
+          else if (pipelineAg)
             check(uccl_lite::multiprocess::launchAgPacketPipelined(
                 mapped, h->agDevice, h->crews, input, output, count, h->rank,
                 base, h->lastPacketGeneration[0], h->lastPacketGeneration[1],
@@ -1392,6 +1437,15 @@ extern "C" int uccl_lite_mp_enqueue(void* handle, int operation,
               mapped, h->crews, input, output, count, h->rank, base,
               h->lastPacketGeneration[0], h->lastPacketGeneration[1],
               h->packetBarrierPhase, cudaStream));
+        else if (ready)
+          check(uccl_lite::multiprocess::launchRsReadySum2Packet(
+              mapped, input, auxiliary, output, ready, h->rank, base,
+              h->lastPacketGeneration[0], cudaStream));
+        else if (auxiliary)
+          check(uccl_lite::multiprocess::launchRsSum2Packet(
+              mapped, input, auxiliary, output, count, h->rank, base,
+              h->lastPacketGeneration[0], h->lastPacketGeneration[1],
+              cudaStream));
         else
           check(uccl_lite::multiprocess::launchRsPacket(
               mapped, input, output, count, h->rank, base,
@@ -1468,6 +1522,43 @@ extern "C" int uccl_lite_mp_enqueue(void* handle, int operation,
     lastError = e.what();
     return -1;
   }
+}
+extern "C" int uccl_lite_mp_enqueue(void* handle, int operation,
+                                    void const* input, void* output,
+                                    size_t count, void* stream) {
+  return enqueueImpl(handle, operation, input, nullptr, output, nullptr,
+                     nullptr, count, stream);
+}
+extern "C" int uccl_lite_mp_enqueue_ag_gemm_128x4096(
+    void* handle, void const* input, void* gathered, void const* weight,
+    void* gemm_output, void* stream) {
+  if (!weight || !gemm_output) {
+    lastError = "AG+GEMM weight or output is null";
+    return -1;
+  }
+  return enqueueImpl(handle, 1, input, weight, gathered, gemm_output, nullptr,
+                     4096, stream);
+}
+extern "C" int uccl_lite_mp_enqueue_rs_sum2(void* handle, void const* input,
+                                              void const* auxiliary,
+                                              void* output, size_t shard_count,
+                                              void* stream) {
+  if (!auxiliary) {
+    lastError = "sum2 auxiliary input is null";
+    return -1;
+  }
+  return enqueueImpl(handle, 2, input, auxiliary, output, nullptr, nullptr,
+                     shard_count, stream);
+}
+extern "C" int uccl_lite_mp_enqueue_rs_ready_sum2(
+    void* handle, void const* input, void const* auxiliary, void* output,
+    uint32_t const* ready, void* stream) {
+  if (!auxiliary || !ready) {
+    lastError = "ready RS input is null";
+    return -1;
+  }
+  return enqueueImpl(handle, 2, input, auxiliary, output, nullptr, ready, 4096,
+                     stream);
 }
 extern "C" int uccl_lite_mp_destroy(void* handle) {
   delete static_cast<Handle*>(handle);

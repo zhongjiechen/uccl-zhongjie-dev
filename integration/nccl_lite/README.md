@@ -14,6 +14,48 @@ layer for AllGather, ReduceScatter(SUM), and AllReduce(SUM). It forwards other
 NCCL calls used by the installed SGLang PyNccl wrapper to the real NCCL
 library. It is not a complete NCCL ABI implementation.
 
+The [EP8 fusion boundary inventory](fusion_candidate_20261112.md) records the
+actual SGLang producer/consumer chain and request shapes for adapting the
+standalone AG+GEMM and GEMM+RS experiments.
+The opt-in [MoE epilogue plus RS experiment](fusion_rs_8l4_20261112.md)
+adds the routed and shared BF16 outputs during packet RS upload. On the
+measured GLM-4.5-Air-FP8 EP8 server, its optimized variant reduced three-run
+median whole-batch time by 1.5%–3.2% for an 8-request short batch and
+2.5%–2.7% for a 32-request longer batch against before/after packet controls.
+The newer [AG+gate GEMM and RS integration](fusion_ag_rs_8l4_20261112.md)
+adds an eight-rank decode AG+gate path. Its numerically matching cuBLAS
+configuration lowered the 8-request whole-batch median by 3.0% against
+packet mode, and a separate 256-output-token eight-request batch by
+2.9%–3.9% against before/after packet controls. It was tied or slower on
+the measured 32- and 64-request workloads.
+The single-kernel AG+GEMM backend remains experimental because some gate
+BF16 logits differ from SGLang's original linear projection.
+The newer opt-in [row-ready MoE combine plus RS path](fusion_ready_rs_8l4_20261112.md)
+lets a separate packet stream consume completed BF16 token rows. On an
+8-request, 256-output-token batch its three-run median was 35.314 s versus
+37.052/37.427 s for before/after packet controls (4.7%/5.6% lower) on the
+initial source revision. A later current-source comparison was 38.094 s
+versus packet 38.491 s (1.0% lower), so the larger gain has not been
+reproduced on the final revision.
+Another same-source packet-then-ready retest measured 37.354 s versus
+36.472 s (2.4% lower) on that long-output batch; the short-output batch
+was tied. This supports a workload-specific gain without fixing its exact
+size.
+Its 64-request result was a tentative 1.9% lower than packet; that control
+included one slow outlier. The recommended ready-combine path does not overlap
+the FP8 down GEMM itself.
+An [opt-in down GEMM readiness prototype](fusion_down_gemm_rs_8l4_20261112.md)
+adds completion counters to the installed Triton FP8 kernel and passed its
+measured decode-shape numerical checks, but did not improve end-to-end time
+over the simpler ready-combine path.
+The [safe AG+gate plus ready RS launcher](run_sglang_ag_ready_rs_8l4.sh)
+composes the two supported hooks. Its first combined SGLang test matched the
+ordinary AG, gate, combine, and RS outputs in the checked calls. On a
+same-seed sequential retest without verification, its 8:64:16 and 8:64:256
+medians were 2.543 and 36.349 s versus 2.694 and 37.354 s for packet
+(5.6% and 2.7% lower). The incremental long-output difference versus ready
+RS alone was only 0.3%.
+
 The proxy maps NCCL communicators by unique ID and rank; NCCL still handles
 initialization and unsupported operations. Its original data path in
 `../../experimental/lite/src/collectives/multiprocess_collectives.cc` uses
@@ -185,6 +227,15 @@ CUDA processes.
 
 ## Use with SGLang
 
+For a single installable artifact, the experimental
+[NCCL wheel](WHEEL.md) bundles the proxy, packet launch scripts, and SGLang
+hooks. Install it into the application's Python environment and run
+`uccl-lite-nccl --real-nccl PATH -- COMMAND` for any EP configuration, with
+NCCL pass-through, or
+`uccl-lite-nccl --mode sglang-ag-ready-rs --profile l4-ep8 --real-nccl PATH -- COMMAND`.
+It uses the same validated boundary below and is not a full NCCL ABI
+replacement.
+
 Set both variables before launching the server and its worker processes:
 
 ```bash
@@ -225,7 +276,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 `run_packet_8l4.sh COMMAND [ARGS...]` sets the tested packet variables and
 executes `COMMAND` with the proxy preloaded. Set `UCCL_LITE_REAL_NCCL` to
 the installed real `libnccl.so.2` before using the wrapper if that library
-is not on the loader's default search path. The wrapper changes no SGLang
+is not on the loader's default search path. This must be the same NCCL binary
+used by SGLang's PyTorch ProcessGroup; forwarding its communicator to a
+different NCCL build causes communicator errors. The wrapper changes no SGLang
 source or model weights.
 
 AR inputs up to 16 KiB use the small GPU path. AR uses flat CPU reduction
@@ -248,6 +301,12 @@ It logs every successfully enqueued AG, RS, and AR call for rank 0, including
 per-communicator cumulative counters. Record the counters after server warmup,
 send one request batch at a time, and compare the counters after each response.
 Tracing adds logging overhead, so disable it for latency measurements.
+For a lower-volume shape inventory, set `UCCL_LITE_NCCL_TRACE_SHAPES=1` instead.
+Rank 0 prints `SHAPE_FIRST` when an operation and element count first appear,
+and a `SHAPE` count at communicator teardown when the worker exits normally.
+First-occurrence lines survive servers that kill workers without running C++
+destructors. These records include server warmup unless the server is launched
+with `--skip-server-warmup`; disable this option for timed runs as well.
 
 For the legacy callback path, `UCCL_LITE_MP_CALLBACK_CPUS=5,11,17,23,29,35,41,47`
 optionally maps CUDA device indices 0 through 7 to one CPU each.
