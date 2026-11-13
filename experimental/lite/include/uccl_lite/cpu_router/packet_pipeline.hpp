@@ -11,6 +11,8 @@
 namespace uccl_lite::cpu_router {
 // Rank masks use uint32_t; capacities are bounds, not the active world size.
 inline constexpr int kMaxRanks = 32;
+// The runtime additionally caps cooperative grids at measured CUDA occupancy.
+inline constexpr int kMaxTransportBlocks = 1024;
 // CUDA NUMA hint, PCI sysfs fallback, then the first online host node.
 int gpuNumaNode(int device);
 struct PacketPort {
@@ -163,11 +165,21 @@ struct PacketPipelineOptions {
   // Optional 64-KiB ReduceScatter GPU progress; the usual 128-KiB choice
   // remains enabled by smallReduceScatterGpuProgress.
   bool smallReduceScatterGpuProgress64K = false;
+  // Adaptive dispatcher only: optionally use GPU reduction/progress for all
+  // complete ReduceScatter inputs through this limit (128 B--64 KiB). Zero
+  // keeps the existing exact-size choices. Requires separate calibration.
+  size_t smallReduceScatterGpuProgressMaxBytes = 0;
   int transportBlocks = 64;
   // Fused GEMM only: cap each upload/download crew. Zero selects by shape.
   int fusedTransportCrew = 0;
   int transportThreads = 256;
+  // 32 uses Blackwell 256-bit loads/stores when all ranges are aligned;
+  // earlier architectures use two 128-bit accesses. Ownership flags stay u32.
+  int transportVectorBytes = 16;
   size_t transportGrainBytes = 16UL << 10;
+  // Optional complete-tensor byte limit for serial upload/consume in one CTA.
+  // Useful for latency-sensitive packets; zero retains independent crews.
+  size_t singleCtaBytes = 0;
   int workersPerNode = 23;
   size_t grainElements = 8192;
   // Optional group-major affinity, groups ordered by first device occurrence.
@@ -200,11 +212,34 @@ struct PacketPipelineOptions {
   // separately from the executor pool to avoid waking every AllReduce worker.
   // Zero uses the full workersPerNode limit; positive values are upper bounds.
   int scatterWorkersPerNode = 16;
+  // Optional cap for CPU ReduceScatter with 256 KiB--1 MiB complete inputs.
+  // Zero preserves scatterWorkersPerNode; requires its own calibration.
+  int smallReduceScatterWorkersPerNode = 0;
+  // Explicit CPU scheduling/merge experiments, independent of GPU progress.
+  bool batchCpuJobs = false;
+  bool directScatterResults = false;
+  // Optional eager SM graph-launch lanes per NUMA group. Zero submits on the
+  // caller; positive values reserve spare NUMA-local CPUs at prepare. Requires
+  // explicit streams, including cudaStreamLegacy; nullptr and
+  // cudaStreamPerThread can be thread relative under per-thread defaults.
+  // Launch lanes spin for up to 2 ms after each task before sleeping.
+  // Capture, replay, DMA and resident/concurrent producers keep caller
+  // launches.
+  int gpuLaunchWorkersPerNode = 0;
+  // Restrict launch discovery to these CPUs when nonempty. The dispatcher
+  // supplies its inspected allowance even if the caller later pins itself.
+  // Direct pipeline discovery otherwise uses the cgroup's permitted CPUs.
+  std::vector<int> gpuLaunchAllowedCpus;
+  // On one host NUMA node, reduce directly into the pinned result packet.
+  // Result-reader credits precede the CPU writes; upload credits follow them.
+  // Multiple NUMA nodes retain the staged partial/merge schedule.
+  bool singleNumaReduction = false;
   ReductionPlacement reduction = ReductionPlacement::Cpu;
-  // GPU reduction only: each packet carries one stripe for every destination
+  // Each packet carries one stripe for every destination
   // instead of draining a complete destination shard before the next one.
   // Keeps all destination PCIe links active; source/destination layout at the
-  // public API is unchanged. Not compatible with flat producer-event stripes.
+  // public API is unchanged. CPU interleaving requires standalone SM transport;
+  // neither placement supports resident GEMM or flat producer-event stripes.
   bool interleaveScatter = false;
   // GPU reduction only. GPU leaders observe upload/reader generations directly;
   // no CPU packet-routing executor is created. Host command publication

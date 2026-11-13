@@ -1,7 +1,10 @@
 #include "router_core.hpp"
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <stdexcept>
+#include <thread>
 #include <sched.h>
 
 using namespace uccl_lite::cpu_router;
@@ -104,6 +107,70 @@ int main() {
       readers[dst] = packet;
     });
     for (auto v : readers) require(v == 42);
+    // A small bounded queue forces reuse while batches interleave with normal
+    // submissions. Test both spinning workers and workers woken from sleep.
+    cpu_set_t permitted;
+    CPU_ZERO(&permitted);
+    require(sched_getaffinity(0, sizeof(permitted), &permitted) == 0);
+    std::vector<int> cpus;
+    for (int id = 0; id < CPU_SETSIZE && cpus.size() < 2; ++id)
+      if (CPU_ISSET(id, &permitted)) cpus.push_back(id);
+    CpuExecutor batches(cpus, 2);
+    std::array<std::atomic<int>, 2> counters{};
+    std::array<size_t, 2> lanes{0, 1};
+    auto increment = [](void* opaque, int lane) {
+      auto* counters = static_cast<std::atomic<int>*>(opaque);
+      counters[lane].fetch_add(1, std::memory_order_relaxed);
+    };
+    for (int round = 0; round < 4; ++round) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      for (int batch = 0; batch < 33; ++batch)
+        batches.enqueueBatch(lanes.data(), cpus.size(), increment,
+                             counters.data());
+      for (size_t lane = 0; lane < cpus.size(); ++lane) {
+        batches.enqueue(lane, increment, counters.data()).wait();
+        require(counters[lane].load() == (round + 1) * 34);
+      }
+    }
+    rejects(
+        [&] { batches.enqueueBatch(nullptr, 1, increment, counters.data()); });
+    size_t invalid[] = {0, cpus.size()};
+    rejects(
+        [&] { batches.enqueueBatch(invalid, 2, increment, counters.data()); });
+    size_t duplicate[] = {0, 0};
+    rejects([&] {
+      batches.enqueueBatch(duplicate, 2, increment, counters.data());
+    });
+    for (size_t lane = 0; lane < cpus.size(); ++lane) {
+      batches.enqueue(lane, increment, counters.data()).wait();
+      require(counters[lane].load() == 137);
+    }
+    // Both producers may wait for credit on the same lane. Re-read its tail
+    // after each wake so a producer cannot overwrite another producer's slot.
+    std::thread batchProducer([&] {
+      for (int i = 0; i < 129; ++i)
+        batches.enqueueBatch(lanes.data(), cpus.size(), increment,
+                             counters.data());
+    });
+    std::thread singleProducer([&] {
+      for (int i = 0; i < 129; ++i)
+        batches.enqueue(0, increment, counters.data());
+    });
+    batchProducer.join();
+    singleProducer.join();
+    for (size_t lane = 0; lane < cpus.size(); ++lane) {
+      batches.enqueue(lane, increment, counters.data()).wait();
+      require(counters[lane].load() == 267 + (lane == 0 ? 129 : 0));
+    }
+    batches.stop();
+    bool stopped = false;
+    try {
+      batches.enqueueBatch(lanes.data(), cpus.size(), increment,
+                           counters.data());
+    } catch (std::runtime_error const&) {
+      stopped = true;
+    }
+    require(stopped);
     std::puts("Router forward/process/multicast checks passed");
   } catch (std::exception const& e) {
     std::fprintf(stderr, "%s\n", e.what());

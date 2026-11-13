@@ -1,5 +1,7 @@
 #include "uccl_lite/backend_policy.hpp"
 #include <cmath>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -148,13 +150,34 @@ int main(int argc, char** argv) {
     m.repetitions = 3;
     m.router = {8, 9, 10};
     m.fallback = {19, 20, 21};
+    m.workload.alignment = w.alignment = 256;
     saveRouterProfile("build/policy-check.profile", {m});
     auto loaded = loadRouterProfile("build/policy-check.profile");
     require(loaded.size() == 1 && loaded[0].topologyIdentity == four.identity,
             "profile round trip");
+    require(loaded[0].workload.alignment == 256,
+            "profile preserves measured buffer alignment");
     p.measurements = loaded;
     require(p.select(four, w).cpuRouter,
             "persisted calibration selects measured winner");
+    auto offset = w;
+    offset.alignment = 16;
+    require(!p.select(four, offset).cpuRouter,
+            "aligned calibration cannot select a slower alignment path");
+    {
+      std::ofstream legacy("build/policy-check-v1.profile");
+      legacy << "uccl-lite-router-profile-v1\n"
+             << std::quoted(m.topologyIdentity) << ' '
+             << std::quoted(m.fallbackIdentity) << ' '
+             << collectiveName(w.collective) << ' ' << w.bytes << ' '
+             << w.inPlace << " 3 1 8 9 10 19 20 21\n";
+    }
+    p.measurements = loadRouterProfile("build/policy-check-v1.profile");
+    require(
+        p.measurements.size() == 1 && p.measurements[0].workload.alignment == 0,
+        "legacy profiles retain unknown alignment for offline reading");
+    require(!p.select(four, w).cpuRouter,
+            "legacy unknown alignment cannot enable a live aligned call");
     require(parseRouterMode("off") == RouterMode::Off, "off parser");
     rejects([] { parseRouterMode("typo"); }, "invalid mode rejected");
     std::cout << "Backend policy: " << checks

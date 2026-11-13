@@ -18,10 +18,15 @@ class CpuCompletion {
 // Fixed pinned lanes and bounded queues. Callbacks execute outside queue locks.
 class CpuExecutor {
  public:
-  explicit CpuExecutor(std::vector<int> cpus, size_t depth = 128);
+  explicit CpuExecutor(std::vector<int> cpus, size_t depth = 128,
+                       uint32_t spinMicros = 100);
   ~CpuExecutor();
   using Callback = void (*)(void*, int);
   CpuCompletion enqueue(size_t lane, Callback run, void* context);
+  // Publish callbacks before notifying sleeping lanes. Indices must be strictly
+  // increasing. The caller tracks completion through the callback protocol.
+  void enqueueBatch(size_t const* lanes, size_t count, Callback run,
+                    void* context);
   CpuCompletion enqueueSum(size_t lane, MemorySpan const* sources, size_t count,
                            MemorySpan destination);
   CpuCompletion enqueueMerge(size_t lane, MemorySpan local, MemorySpan remote,

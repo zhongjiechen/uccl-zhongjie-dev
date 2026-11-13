@@ -42,13 +42,14 @@ struct CpuExecutor::Impl {
     std::shared_ptr<CpuTaskState> state = std::make_shared<CpuTaskState>();
     std::vector<Task> queue;
     std::atomic<uint64_t> tail{0};
+    std::atomic<bool> sleeping{false};
     std::condition_variable available;
     std::thread thread;
   };
   std::vector<std::unique_ptr<Lane>> lanes;
   std::atomic<bool> stopping{false};
   size_t depth;
-  Impl(std::vector<int> const& cpus, size_t d) : depth(d) {
+  Impl(std::vector<int> const& cpus, size_t d, uint32_t spinMicros) : depth(d) {
     if (cpus.empty() || !depth)
       throw std::invalid_argument("empty CPU executor");
     for (int cpu : cpus) {
@@ -59,7 +60,7 @@ struct CpuExecutor::Impl {
       lanes.push_back(std::move(l));
     }
     for (size_t i = 0; i < lanes.size(); ++i) {
-      lanes[i]->thread = std::thread([this, i, cpu = cpus[i]] {
+      lanes[i]->thread = std::thread([this, i, cpu = cpus[i], spinMicros] {
         cpu_set_t mask;
         CPU_ZERO(&mask);
         CPU_SET(cpu, &mask);
@@ -69,7 +70,7 @@ struct CpuExecutor::Impl {
         while (true) {
           if (head) {
             auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::microseconds(100);
+                            std::chrono::microseconds(spinMicros);
             while (lane.tail.load(std::memory_order_acquire) == head &&
                    !stopping.load() &&
                    std::chrono::steady_clock::now() < deadline)
@@ -78,10 +79,12 @@ struct CpuExecutor::Impl {
           Task task;
           {
             std::unique_lock<std::mutex> lock(lane.state->mutex);
+            lane.sleeping.store(true, std::memory_order_relaxed);
             lane.available.wait(lock, [&] {
               return stopping.load() ||
                      lane.tail.load(std::memory_order_acquire) > head;
             });
+            lane.sleeping.store(false, std::memory_order_relaxed);
             if (stopping.load() && lane.tail.load() == head) return;
             task = lane.queue[head % depth];
           }
@@ -111,14 +114,19 @@ struct CpuExecutor::Impl {
   }
   void stop() {
     stopping.store(true);
-    for (auto& l : lanes) l->available.notify_all();
+    for (auto& l : lanes) {
+      std::lock_guard<std::mutex> lock(l->state->mutex);
+      l->available.notify_all();
+      l->state->credit.notify_all();
+    }
     for (auto& l : lanes)
       if (l->thread.joinable()) l->thread.join();
   }
   ~Impl() { stop(); }
 };
-CpuExecutor::CpuExecutor(std::vector<int> cpus, size_t depth)
-    : impl_(std::make_unique<Impl>(cpus, depth)) {}
+CpuExecutor::CpuExecutor(std::vector<int> cpus, size_t depth,
+                         uint32_t spinMicros)
+    : impl_(std::make_unique<Impl>(cpus, depth, spinMicros)) {}
 CpuExecutor::~CpuExecutor() = default;
 void CpuExecutor::stop() { impl_->stop(); }
 CpuCompletion CpuExecutor::enqueue(size_t index, Callback fn, void* context) {
@@ -127,16 +135,51 @@ CpuCompletion CpuExecutor::enqueue(size_t index, Callback fn, void* context) {
   auto& lane = *impl_->lanes[index];
   std::unique_lock<std::mutex> lock(lane.state->mutex);
   uint64_t tail = lane.tail.load();
-  lane.state->credit.wait(
-      lock, [&] { return tail - lane.state->completed.load() < impl_->depth; });
+  lane.state->credit.wait(lock, [&] {
+    tail = lane.tail.load(std::memory_order_relaxed);
+    return tail - lane.state->completed.load(std::memory_order_acquire) <
+               impl_->depth ||
+           impl_->stopping.load();
+  });
   if (impl_->stopping.load()) throw std::runtime_error("CPU executor stopped");
   lane.queue[tail % impl_->depth] = {fn, context};
   lane.tail.store(tail + 1, std::memory_order_release);
-  lane.available.notify_one();
+  bool wake = lane.sleeping.load(std::memory_order_relaxed);
+  lock.unlock();
+  if (wake) lane.available.notify_one();
   CpuCompletion done;
   done.state_ = lane.state;
   done.ticket_ = tail + 1;
   return done;
+}
+void CpuExecutor::enqueueBatch(size_t const* indices, size_t count, Callback fn,
+                               void* context) {
+  if (!fn || (count && !indices))
+    throw std::invalid_argument("invalid CPU batch");
+  for (size_t i = 0; i < count; ++i)
+    if (indices[i] >= impl_->lanes.size() ||
+        (i && indices[i] <= indices[i - 1]))
+      throw std::invalid_argument("CPU batch lanes must be increasing");
+  for (size_t i = 0; i < count; ++i) {
+    auto& lane = *impl_->lanes[indices[i]];
+    std::unique_lock<std::mutex> lock(lane.state->mutex);
+    auto tail = lane.tail.load(std::memory_order_relaxed);
+    lane.state->credit.wait(lock, [&] {
+      tail = lane.tail.load(std::memory_order_relaxed);
+      return tail - lane.state->completed.load(std::memory_order_acquire) <
+                 impl_->depth ||
+             impl_->stopping.load();
+    });
+    if (impl_->stopping.load())
+      throw std::runtime_error("CPU executor stopped");
+    lane.queue[tail % impl_->depth] = {fn, context};
+    lane.tail.store(tail + 1, std::memory_order_release);
+  }
+  for (size_t i = 0; i < count; ++i) {
+    auto& lane = *impl_->lanes[indices[i]];
+    if (lane.sleeping.load(std::memory_order_relaxed))
+      lane.available.notify_one();
+  }
 }
 CpuCompletion CpuExecutor::enqueueSum(size_t index, MemorySpan const* sources,
                                       size_t count, MemorySpan destination) {
@@ -145,8 +188,12 @@ CpuCompletion CpuExecutor::enqueueSum(size_t index, MemorySpan const* sources,
   auto& lane = *impl_->lanes[index];
   std::unique_lock<std::mutex> lock(lane.state->mutex);
   auto tail = lane.tail.load();
-  lane.state->credit.wait(
-      lock, [&] { return tail - lane.state->completed.load() < impl_->depth; });
+  lane.state->credit.wait(lock, [&] {
+    tail = lane.tail.load(std::memory_order_relaxed);
+    return tail - lane.state->completed.load(std::memory_order_acquire) <
+               impl_->depth ||
+           impl_->stopping.load();
+  });
   if (impl_->stopping.load()) throw std::runtime_error("CPU executor stopped");
   Impl::Task task;
   task.count = count;
@@ -155,7 +202,9 @@ CpuCompletion CpuExecutor::enqueueSum(size_t index, MemorySpan const* sources,
   for (size_t i = 0; i < count; ++i) task.sources[i] = sources[i];
   lane.queue[tail % impl_->depth] = std::move(task);
   lane.tail.store(tail + 1, std::memory_order_release);
-  lane.available.notify_one();
+  bool wake = lane.sleeping.load(std::memory_order_relaxed);
+  lock.unlock();
+  if (wake) lane.available.notify_one();
   CpuCompletion done;
   done.state_ = lane.state;
   done.ticket_ = tail + 1;

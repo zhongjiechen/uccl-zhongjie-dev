@@ -17,6 +17,9 @@ struct Workload {
   // Complete per-rank output for AG, complete input for RS, tensor size for AR.
   size_t bytes = 0;
   bool inPlace = false;
+  // Minimum input/output pointer alignment, capped at 256 bytes. Zero denotes
+  // a caller-defined/legacy key; live dispatcher calls always record alignment.
+  unsigned alignment = 0;
 };
 
 struct Topology {

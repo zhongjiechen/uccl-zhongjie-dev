@@ -26,6 +26,8 @@ records give their own topology and measurement protocol.
 
 | File | Scope and method |
 | --- | --- |
+| [rs_submit_8l4_20261113](data/rs_submit_8l4_20261113/provenance.json) | Eight-L4 BF16 ReduceScatter follow-up: small-message GPU progress, optional parallel host submission, fixed-configuration paired NCCL confirmation, launch-skew traces, dense/sparse call-spacing probes, negative results, and eager/graph/capture-guard checks. |
+| [rs_opt_8l4_20261113](data/rs_opt_8l4_20261113/provenance.json) | Eight-L4 BF16 ReduceScatter CPU scheduling: fixed worker-cap, batch-publication, direct-result and CPU destination-stripe ablations, paired NCCL controls over 1 KiB--4 MiB, reversed-order confirmation, raw per-call samples, calibration replay and eager/graph/numerical checks. |
 | [optimization_20261110/README.md](data/optimization_20261110/README.md) | Follow-up four-L4 and two-node AR/AG/RS optimization: peer-read small-message path, compact source-completion events, topology-specific local schedules, complete paired samples, bottleneck evidence, and retained failed probes. |
 | [multinode_serial_20261111](data/multinode_serial_20261111/README.md) | Two-node AR/AG/RS direct local CUDA-IPC variants against paired NCCL 2.28.7, 1 KiB–1 GiB, with 20 warmups, three alternating runs, complete per-call checks, raw samples, launch-geometry losses, and NCCL protocol diagnostics. |
 | [nccl_spike_2x4l4_20261111](data/nccl_spike_2x4l4_20261111/README.md) | Targeted two-node NCCL 2.28.7 protocol diagnosis: tuning logs show default RING+LL at the spike sizes; three alternating checked rounds compare LL and forced SIMPLE with the same ring and channels. |

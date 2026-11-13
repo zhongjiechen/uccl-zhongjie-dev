@@ -137,12 +137,88 @@ int main() {
             "GPU progress cannot bypass CPU arithmetic");
     gpu.gpuProgress = false;
     gpu.interleaveScatter = true;
+    CollectiveDispatcher cpuStriped(t, autoPolicy, callback, gpu);
+    require(cpuStriped.topology().identity != striped.topology().identity &&
+                !cpuStriped.prepare(call).cpuRouter &&
+                !cpuStriped.routerInitialized(),
+            "CPU stripes require separate evidence and preserve fallback");
+    gpu.concurrentProducer = true;
     rejects([&] { CollectiveDispatcher invalid(t, autoPolicy, callback, gpu); },
-            "interleaved scatter cannot silently use CPU reduction");
+            "striped packets reject flat concurrent-producer epochs");
+    gpu.reduction = cpu_router::ReductionPlacement::Gpu;
+    CollectiveDispatcher concurrentGpu(t, autoPolicy, callback, gpu);
+    require(!concurrentGpu.prepare(call).cpuRouter &&
+                !concurrentGpu.routerInitialized(),
+            "existing GPU concurrent transport retains unmeasured fallback");
+    gpu.concurrentProducer = false;
     gpu.reduction = static_cast<cpu_router::ReductionPlacement>(99);
     rejects(
         [&] { CollectiveDispatcher invalid(t, autoPolicy, callback, gpu); },
         "invalid reduction placement is rejected before CUDA initialization");
+    BackendPolicy calibrated;
+    calibrated.fallbackIdentity = "host-only-fallback-v1";
+    calibrated.measurements.push_back({automatic.topology().identity,
+                                       calibrated.fallbackIdentity,
+                                       call.workload(),
+                                       {8, 9, 10},
+                                       {19, 20, 21},
+                                       3,
+                                       true});
+    require(calibrated.select(automatic.topology(), call.workload()).cpuRouter,
+            "matching calibration is eligible before changing geometry");
+    require(automatic.topology().identity.find(";router-build-id=") !=
+                std::string::npos,
+            "software identity records the containing CUDA module build");
+    auto offsetCall = call;
+    for (auto& port : offsetCall.ports) {
+      port.input = static_cast<uint16_t const*>(port.input) + 1;
+      port.output = static_cast<uint16_t*>(port.output) + 1;
+    }
+    CollectiveDispatcher offset(t, calibrated, callback);
+    require(
+        !offset.prepare(offsetCall).cpuRouter && !offset.routerInitialized(),
+        "different buffer alignment retains fallback without allocation");
+    for (int choice = 0; choice < 10; ++choice) {
+      cpu_router::CpuRouterOptions tuned;
+      if (choice == 0) tuned.transportVectorBytes = 32;
+      if (choice == 1) tuned.singleCtaBytes = 65536;
+      if (choice == 2) tuned.singleNumaReduction = true;
+      if (choice == 3) tuned.transportBlocks = 512;
+      if (choice == 4) tuned.smallReduceScatterWorkersPerNode = 4;
+      if (choice == 5) tuned.batchCpuJobs = true;
+      if (choice == 6) tuned.directScatterResults = true;
+      if (choice == 7) tuned.gpuLaunchWorkersPerNode = 1;
+      if (choice == 8) tuned.smallReduceScatterGpuProgressMaxBytes = 65536;
+      if (choice == 9) {
+        tuned.gpuLaunchWorkersPerNode = 1;
+        tuned.gpuLaunchAllowedCpus = {1, 3};
+      }
+      CollectiveDispatcher changed(t, calibrated, callback, tuned);
+      require(!changed.prepare(call).cpuRouter && !changed.routerInitialized(),
+              "new transport options cannot reuse another configuration's "
+              "calibration");
+    }
+    cpu_router::CpuRouterOptions invalidWorkers;
+    invalidWorkers.smallReduceScatterWorkersPerNode = 64;
+    rejects(
+        [&] {
+          CollectiveDispatcher invalid(t, autoPolicy, callback, invalidWorkers);
+        },
+        "small RS worker limit is validated before CUDA initialization");
+    invalidWorkers = {};
+    invalidWorkers.gpuLaunchWorkersPerNode = 33;
+    rejects(
+        [&] {
+          CollectiveDispatcher invalid(t, autoPolicy, callback, invalidWorkers);
+        },
+        "GPU launch worker limit is validated before CUDA initialization");
+    invalidWorkers = {};
+    invalidWorkers.smallReduceScatterGpuProgressMaxBytes = 131072;
+    rejects(
+        [&] {
+          CollectiveDispatcher invalid(t, autoPolicy, callback, invalidWorkers);
+        },
+        "small RS progress threshold is validated before CUDA initialization");
     std::cout << "Dispatcher: " << checks
               << " checks passed; no GPU initialization needed\n";
   } catch (std::exception const& e) {

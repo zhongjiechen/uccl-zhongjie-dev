@@ -11,7 +11,8 @@
 namespace uccl_lite {
 namespace {
 constexpr char const* kReference = "reference:l4x8-no-p2p-20261012";
-constexpr char const* kProfileHeader = "uccl-lite-router-profile-v1";
+constexpr char const* kProfileHeader = "uccl-lite-router-profile-v2";
+constexpr char const* kLegacyProfileHeader = "uccl-lite-router-profile-v1";
 
 bool valid(TimingRange const& t) {
   return std::isfinite(t.minimum) && std::isfinite(t.median) &&
@@ -19,22 +20,26 @@ bool valid(TimingRange const& t) {
          t.median <= t.maximum;
 }
 void validate(Measurement const& m) {
+  unsigned alignment = m.workload.alignment;
   if (m.topologyIdentity.empty() || m.fallbackIdentity.empty() ||
       !m.workload.bytes || !valid(m.router) || !valid(m.fallback) ||
       m.repetitions < 3 || !m.correct ||
-      m.workload.dtype != ScalarType::BFloat16)
+      m.workload.dtype != ScalarType::BFloat16 || alignment > 256 ||
+      (alignment && (alignment & (alignment - 1))))
     throw std::invalid_argument(
         "invalid or unvalidated CPU-router measurement");
 }
 bool sameWorkload(Workload const& a, Workload const& b) {
   return a.collective == b.collective && a.dtype == b.dtype &&
-         a.bytes == b.bytes && a.inPlace == b.inPlace;
+         a.bytes == b.bytes && a.inPlace == b.inPlace &&
+         a.alignment == b.alignment;
 }
 bool capable(Topology const& t, Workload const& w) {
   size_t n = t.devices.size();
   if (!n || n > 32 || !t.avx2 || w.dtype != ScalarType::BFloat16 || !w.bytes ||
       w.bytes % 2 || t.numaNodes.size() != n || t.mappedHost.size() != n ||
-      t.gpuNames.size() != n || t.peerAccess.size() != n * n ||
+      (w.alignment && w.alignment < 2) || t.gpuNames.size() != n ||
+      t.peerAccess.size() != n * n ||
       std::set<int>(t.devices.begin(), t.devices.end()).size() != n)
     return false;
   if (w.collective != Collective::AllReduce && w.bytes % (2 * n)) return false;
@@ -178,10 +183,11 @@ void saveRouterProfile(std::string const& path,
     output << std::quoted(m.topologyIdentity) << ' '
            << std::quoted(m.fallbackIdentity) << ' '
            << collectiveName(m.workload.collective) << ' ' << m.workload.bytes
-           << ' ' << m.workload.inPlace << ' ' << m.repetitions << ' '
-           << m.correct << ' ' << m.router.minimum << ' ' << m.router.median
-           << ' ' << m.router.maximum << ' ' << m.fallback.minimum << ' '
-           << m.fallback.median << ' ' << m.fallback.maximum << '\n';
+           << ' ' << m.workload.inPlace << ' ' << m.workload.alignment << ' '
+           << m.repetitions << ' ' << m.correct << ' ' << m.router.minimum
+           << ' ' << m.router.median << ' ' << m.router.maximum << ' '
+           << m.fallback.minimum << ' ' << m.fallback.median << ' '
+           << m.fallback.maximum << '\n';
   output.flush();
   if (!output) throw std::runtime_error("failed to write calibration profile");
 }
@@ -189,9 +195,11 @@ void saveRouterProfile(std::string const& path,
 std::vector<Measurement> loadRouterProfile(std::string const& path) {
   std::ifstream input(path);
   std::string line;
-  if (!input || !std::getline(input, line) || line != kProfileHeader)
+  if (!input || !std::getline(input, line) ||
+      (line != kProfileHeader && line != kLegacyProfileHeader))
     throw std::invalid_argument("missing or unsupported CPU-router profile: " +
                                 path);
+  bool legacy = line == kLegacyProfileHeader;
   std::vector<Measurement> output;
   while (std::getline(input, line)) {
     if (line.empty()) continue;
@@ -201,7 +209,9 @@ std::vector<Measurement> loadRouterProfile(std::string const& path) {
     std::istringstream row(line);
     if (!(row >> std::quoted(m.topologyIdentity) >>
           std::quoted(m.fallbackIdentity) >> op >> m.workload.bytes >>
-          placement >> m.repetitions >> correct >> m.router.minimum >>
+          placement) ||
+        (!legacy && !(row >> m.workload.alignment)) ||
+        !(row >> m.repetitions >> correct >> m.router.minimum >>
           m.router.median >> m.router.maximum >> m.fallback.minimum >>
           m.fallback.median >> m.fallback.maximum) ||
         row >> extra || placement < 0 || placement > 1 || correct != 1)

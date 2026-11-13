@@ -51,12 +51,22 @@ int main(int argc, char** argv) {
   try {
     bool small = false;
     bool gpuReduce = false;
+    bool singleNumaReduction = false;
     bool gpuProgress = false;
     bool agPerSource = false;
     bool interleaveScatter = false;
+    bool batchCpuJobs = false, directScatterResults = false;
+    int smallRsWorkers = 0;
+    int gpuLaunchWorkers = 0;
     int delayRank = -1;
     size_t packetBytes = 512UL << 10;
+    size_t minPacketBytes = 128UL << 10;
+    size_t singleCtaBytes = 0;
     int ranks = 8;
+    int transportThreads = 256;
+    int transportBlocks = 64;
+    int workersPerNode = 23;
+    int transportVectorBytes = 16;
     std::vector<int> devices;
     for (int i = 1; i < argc; ++i) {
       std::string arg = argv[i];
@@ -71,6 +81,18 @@ int main(int argc, char** argv) {
         small = true;
       else if (arg == "--gpu-reduce")
         gpuReduce = true;
+      else if (arg == "--cpu-interleave-scatter")
+        interleaveScatter = true;
+      else if (arg == "--batch-cpu-jobs")
+        batchCpuJobs = true;
+      else if (arg == "--gpu-launch-workers-per-node" && i + 1 < argc)
+        gpuLaunchWorkers = std::stoi(argv[++i]);
+      else if (arg == "--direct-scatter-results")
+        directScatterResults = true;
+      else if (arg == "--small-rs-workers-per-node" && i + 1 < argc)
+        smallRsWorkers = std::stoi(argv[++i]);
+      else if (arg == "--single-numa-reduction")
+        singleNumaReduction = true;
       else if (arg == "--gpu-progress") {
         gpuReduce = true;
         gpuProgress = true;
@@ -85,6 +107,18 @@ int main(int argc, char** argv) {
         delayRank = std::stoi(argv[++i]);
       else if (arg == "--packet-bytes" && i + 1 < argc)
         packetBytes = std::stoull(argv[++i]);
+      else if (arg == "--min-packet-bytes" && i + 1 < argc)
+        minPacketBytes = std::stoull(argv[++i]);
+      else if (arg == "--transport-threads" && i + 1 < argc)
+        transportThreads = std::stoi(argv[++i]);
+      else if (arg == "--transport-blocks" && i + 1 < argc)
+        transportBlocks = std::stoi(argv[++i]);
+      else if (arg == "--workers-per-node" && i + 1 < argc)
+        workersPerNode = std::stoi(argv[++i]);
+      else if (arg == "--transport-vector-bytes" && i + 1 < argc)
+        transportVectorBytes = std::stoi(argv[++i]);
+      else if (arg == "--single-cta-bytes" && i + 1 < argc)
+        singleCtaBytes = std::stoull(argv[++i]);
       else
         throw std::invalid_argument("unknown router check option");
     }
@@ -97,9 +131,20 @@ int main(int argc, char** argv) {
       throw std::invalid_argument("invalid rank count");
     uccl_lite::cpu_router::CpuRouterOptions options;
     options.interleaveScatter = interleaveScatter;
+    options.batchCpuJobs = batchCpuJobs;
+    options.directScatterResults = directScatterResults;
+    options.gpuLaunchWorkersPerNode = gpuLaunchWorkers;
+    options.smallReduceScatterWorkersPerNode = smallRsWorkers;
     options.gpuProgress = gpuProgress;
     options.agPerSourceProgress = agPerSource;
     options.packetBytes = packetBytes;
+    options.minPacketBytes = minPacketBytes;
+    options.transportThreads = transportThreads;
+    options.transportBlocks = transportBlocks;
+    options.workersPerNode = workersPerNode;
+    options.transportVectorBytes = transportVectorBytes;
+    options.singleCtaBytes = singleCtaBytes;
+    options.singleNumaReduction = singleNumaReduction;
     if (gpuReduce)
       options.reduction = uccl_lite::cpu_router::ReductionPlacement::Gpu;
     options.maxTensorBytes = 32UL << 20;

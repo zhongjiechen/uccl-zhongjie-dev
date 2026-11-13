@@ -35,6 +35,40 @@ struct DevicePacketOwnership {
 // Device-side channel operations compose with signaling and caller CTA
 // barriers.
 struct DeviceChannel {
+  struct alignas(32) Vector32 {
+    uint4 lo, hi;
+  };
+  // Packet callers check 32-byte alignment and retain ownership until readers
+  // finish; control signals remain independent 32-bit system-scope accesses.
+  __device__ static Vector32 get32(void const* p) {
+    Vector32 v;
+#if __CUDA_ARCH__ >= 1000 &&      \
+    (__CUDACC_VER_MAJOR__ > 12 || \
+     (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9))
+    asm volatile("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+                 : "=r"(v.lo.x), "=r"(v.lo.y), "=r"(v.lo.z), "=r"(v.lo.w),
+                   "=r"(v.hi.x), "=r"(v.hi.y), "=r"(v.hi.z), "=r"(v.hi.w)
+                 : "l"(p)
+                 : "memory");
+#else
+    v.lo = get16(p);
+    v.hi = get16(static_cast<char const*>(p) + 16);
+#endif
+    return v;
+  }
+  __device__ static void put32(void* p, Vector32 v) {
+#if __CUDA_ARCH__ >= 1000 &&      \
+    (__CUDACC_VER_MAJOR__ > 12 || \
+     (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9))
+    asm volatile("st.global.v8.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8};" ::"l"(p),
+                 "r"(v.lo.x), "r"(v.lo.y), "r"(v.lo.z), "r"(v.lo.w),
+                 "r"(v.hi.x), "r"(v.hi.y), "r"(v.hi.z), "r"(v.hi.w)
+                 : "memory");
+#else
+    put16(p, v.lo);
+    put16(static_cast<char*>(p) + 16, v.hi);
+#endif
+  }
   __device__ static uint4 get16(void const* p) {
     return *static_cast<uint4 const*>(p);
   }

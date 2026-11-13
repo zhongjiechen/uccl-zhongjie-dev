@@ -112,14 +112,17 @@ on the longer batch was only 0.3% in this sequential test.
 #### 8xL4 GPU
 
 This comparison uses GPUs 0–3 on NUMA node 0 and 4–7 on node 1.
-AllReduce is in place; AllGather and ReduceScatter are out of place. Each UCCL Lite curve
-uses the fastest measured project-owned path at that size, chosen without
-looking at NCCL. The CPU router is selected for all large AR/AG/RS sizes.
+AllReduce is in place; AllGather and ReduceScatter are out of place. The earlier
+overview's UCCL Lite curves use the fastest measured project-owned path at that
+size, chosen without looking at NCCL. The CPU router is selected for all large
+AR/AG/RS sizes.
 At 128 and 256 KiB, AllReduce uses a compact CPU router with four workers
 per NUMA node and 16 transport blocks. [Paired measurements](benchmarks/data/ar_compact_8l4_20261111/README.md)
 replace the earlier 128 KiB local-path selection. At 128 KiB, ReduceScatter
-selects GPU reduction/progress; RS uses the CPU-reduction router at other
-sizes. Its 256 KiB–4 MiB calls use 128 KiB packets.
+selects GPU reduction/progress; its RS curve uses the CPU-reduction router at
+other sizes. Its 256 KiB–4 MiB calls use 128 KiB packets. The separate
+ReduceScatter follow-up below compares fixed configurations on a later source
+revision, including optional GPU progress through 64 KiB.
 AllGather uses 512 KiB packets below 4 MiB and 2 MiB packets from 4 MiB
 through 1 GiB. The [paired AllGather measurements](benchmarks/data/ag_packet_8l4_20261111/README.md)
 and packet-size screening support this choice.
@@ -134,7 +137,30 @@ and packet-size screening support this choice.
 
 ##### ReduceScatter on single 8xL4 GPU
 
-![8xL4 GPU ReduceScatter: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput versus NCCL](docs/assets/collectives-8l4-reducescatter-v6.svg)
+![Eight-L4 BF16 ReduceScatter: fixed small-message GPU-progress and parallel-submission configurations versus the previous CPU-router configuration and paired NCCL, 1 KiB–1 MiB](benchmarks/data/rs_submit_8l4_20261113/summary.svg)
+
+This follow-up measures BF16 out-of-place ReduceScatter with CUDA 12.9 and
+NCCL 2.28.9; sizes are complete input bytes per rank. Each point is the median
+of two sweeps in reversed configuration order; each sweep uses ten warmups and
+five alternating NCCL/router repeats of twenty checked calls. Timing is the
+slowest-rank eager CUDA-event interval,
+including host submission gaps. The configurations are fixed across sizes;
+the figure does not select the best variant at each size.
+
+Small-message GPU progress plus eight CPU submission lanes reduces 1/32/64-KiB
+latency to **84.2/88.6/104.7 us**, versus **99.3/115.7/137.5 us** for the prior
+worker-cap/batch configuration. The combined configuration is **1.41/1.44/1.30x**
+faster than its paired NCCL control at those sizes. There is no material
+additional gain at 1 MiB. Parallel submission is opt-in, spins for up to 2 ms,
+and regresses with 5-ms call spacing; GPU progress alone avoids these extra
+submission threads. [Configuration, limitations, and validation](docs/cpu-router.md#follow-up-small-messages-and-host-submission)
+and [raw measurements](benchmarks/data/rs_submit_8l4_20261113/provenance.json)
+include the slower variants and call-spacing probes. These standalone results
+do not establish an SGLang or multiprocess drop-in speedup.
+
+The [earlier 1-KiB–1-GiB overview](docs/assets/collectives-8l4-reducescatter-v6.svg)
+retains the historical large-message throughput measurements; those points
+were not remeasured with this follow-up's options.
 
 #### 8xL4 SHM
 

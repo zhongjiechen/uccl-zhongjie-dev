@@ -66,8 +66,10 @@ int residentTransportCrew(int maxBlocks, size_t work, size_t totalElements,
   // cooperative GEMM grid. Prefill needs more transport bandwidth than decode.
   if (layout == PacketLayout::Scatter && work * 2 == packetBytes) {
     int limit = 12;
-    if (totalElements < (1UL << 20)) limit = 4;
-    else if (totalElements < kShortPrefillElements) limit = 16;
+    if (totalElements < (1UL << 20))
+      limit = 4;
+    else if (totalElements < kShortPrefillElements)
+      limit = 16;
     crew = std::min(crew, limit);
   }
   return crew;
@@ -92,11 +94,11 @@ struct alignas(16) Transport {
   uint16_t const* input;
   uint16_t* output;
   uint16_t* uploads[kSlots];
-  uint16_t const* sources[kSlots][kMaxRanks];
+  uint16_t const* const* sources[kSlots];
   uint16_t const* results[kSlots];
   Flags* flags;
   Flags* readerFlags;
-  Flags* peerFlags[kMaxRanks];
+  Flags* const* peerFlags;
   GridState* grid;
   PacketProgram plan;
   size_t packetElements;
@@ -108,6 +110,7 @@ struct alignas(16) Transport {
   bool interleaveScatter;
   bool gpuProgress;
   bool agPerSourceProgress;
+  int vectorBytes;
   int producerBlocks;
   int consumerBlocks;
   uint32_t initialPhase[2];
@@ -195,6 +198,10 @@ __device__ uint32_t finishPair(uint32_t routed, uint32_t own) {
   return uint32_t(finishScatter(routed, own)) |
          (uint32_t(finishScatter(routed >> 16, own >> 16)) << 16);
 }
+__device__ uint4 finishVector(uint4 routed, uint4 own) {
+  return make_uint4(finishPair(routed.x, own.x), finishPair(routed.y, own.y),
+                    finishPair(routed.z, own.z), finishPair(routed.w, own.w));
+}
 // Sum immutable uploaded packets on the destination GPU. The rank's local
 // contribution stays on-device, including ReduceScatter's retained shard.
 // Accumulate in FP32 and round once; unlike CPU hierarchical BF16 reduction,
@@ -226,7 +233,33 @@ __device__ uint4 sumPacket8(Transport const& p, int slot, size_t offset,
          << 16);
   return make_uint4(words[0], words[1], words[2], words[3]);
 }
-__device__ void upload(Transport const& p, size_t tile, bool vector,
+__device__ DeviceChannel::Vector32 sumPacket16(Transport const& p, int slot,
+                                               size_t offset, size_t global) {
+  float sum[16] = {};
+  for (int rank = 0; rank < p.plan.ranks; ++rank) {
+    if (!(p.plan.sources & (1U << rank))) continue;
+    auto from =
+        rank == p.rank ? p.input + global : p.sources[slot][rank] + offset;
+    auto v = DeviceChannel::get32(from);
+    uint32_t words[8] = {v.lo.x, v.lo.y, v.lo.z, v.lo.w,
+                         v.hi.x, v.hi.y, v.hi.z, v.hi.w};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      sum[j * 2] += __uint_as_float(words[j] << 16);
+      sum[j * 2 + 1] += __uint_as_float(words[j] & 0xffff0000U);
+    }
+  }
+  uint32_t words[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j)
+    words[j] =
+        uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(sum[j * 2]))) |
+        (uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(sum[j * 2 + 1])))
+         << 16);
+  return {make_uint4(words[0], words[1], words[2], words[3]),
+          make_uint4(words[4], words[5], words[6], words[7])};
+}
+__device__ void upload(Transport const& p, size_t tile, bool vector, bool wide,
                        size_t lane, size_t stride) {
   if (p.interleaveScatter) {
     if (!(p.plan.sources & (1U << p.rank))) return;
@@ -238,7 +271,11 @@ __device__ void upload(Transport const& p, size_t tile, bool vector,
         continue;  // Retained locally, just like flat scatter.
       auto from = p.input + size_t(dest) * shard + tile * stripe;
       auto to = p.uploads[tile & 1] + size_t(dest) * stripe;
-      if (vector)
+      if (wide)
+        for (size_t i = lane; i < n / 16; i += stride)
+          DeviceChannel::put32(to + i * 16,
+                               DeviceChannel::get32(from + i * 16));
+      else if (vector)
         for (size_t i = lane; i < n / 8; i += stride)
           DeviceChannel::put16(to + i * 8, DeviceChannel::get16(from + i * 8));
       else
@@ -250,7 +287,12 @@ __device__ void upload(Transport const& p, size_t tile, bool vector,
   auto f = p.plan.uploadRanges(p.rank, tile, p.packetElements);
   for (int range = 0; range < f.count; ++range) {
     auto r = f.ranges[range];
-    if (vector)
+    if (wide)
+      for (size_t i = lane; i < r.elements / 16; i += stride)
+        DeviceChannel::put32(
+            p.uploads[tile & 1] + r.packetOffset + i * 16,
+            DeviceChannel::get32(p.input + r.inputOffset + i * 16));
+    else if (vector)
       for (size_t i = lane; i < r.elements / 8; i += stride)
         DeviceChannel::put16(
             p.uploads[tile & 1] + r.packetOffset + i * 8,
@@ -308,10 +350,13 @@ __device__ void waitGemm(Transport const& p, size_t tile) {
 }
 // Input credits and output acknowledgements share one synchronization protocol
 // across layouts. Prefetch and consume operate on disjoint memory ranges.
+template <int GpuReduction = -1, int VectorBytes = 0>
 __device__ void runTransport(Transport const& p, size_t firstTile,
-                             size_t endTile) {
-  bool producer = blockIdx.x < p.producerBlocks;
-  int block = producer ? blockIdx.x : blockIdx.x - p.producerBlocks;
+                             size_t endTile, int blockIndex = -1) {
+  bool gpuReduce = GpuReduction < 0 ? p.gpuReduce : bool(GpuReduction);
+  int index = blockIndex < 0 ? int(blockIdx.x) : blockIndex;
+  bool producer = index < p.producerBlocks;
+  int block = producer ? index : index - p.producerBlocks;
   int blocks = producer ? p.producerBlocks : p.consumerBlocks;
   GridState* state = p.grid + (producer ? 0 : 1);
   if (p.profile && block == 0 && threadIdx.x == 0) state->times[0] = timer();
@@ -325,6 +370,16 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
                 p.plan.inputElements % 8 == 0 && p.packetElements % 8 == 0 &&
                 (p.plan.layout != PacketLayout::Scatter ||
                  (p.plan.inputElements / p.plan.ranks) % 8 == 0);
+  bool wide =
+      vector && (VectorBytes ? VectorBytes : p.vectorBytes) == 32 &&
+      ((reinterpret_cast<uintptr_t>(p.input) |
+        reinterpret_cast<uintptr_t>(p.output)) &
+       31) == 0 &&
+      p.plan.inputElements % 16 == 0 && p.packetElements % 16 == 0 &&
+      (p.plan.layout != PacketLayout::Scatter ||
+       (p.plan.inputElements / p.plan.ranks) % 16 == 0) &&
+      (!p.interleaveScatter || (p.packetElements / p.plan.ranks) % 16 == 0);
+  size_t vectorElements = wide ? 16 : 8;
   size_t thread = block * blockDim.x + threadIdx.x,
          stride = blocks * blockDim.x;
   if (producer) {
@@ -355,7 +410,7 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
             __nanosleep(64);
       }
       __syncthreads();
-      upload(p, tile, vector, thread, stride);
+      upload(p, tile, vector, wide, thread, stride);
       barrier(state, phase, blocks);
       if (block == 0 && threadIdx.x == 0)
         DevicePacketOwnership{{&p.flags->uploaded[slot][p.rank]},
@@ -366,14 +421,13 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
     if (p.profile && block == 0 && threadIdx.x == 0) state->times[5] = timer();
     return;
   }
-  uint32_t fullMask = p.plan.ranks == 32 ? 0xffffffffU
-                                        : (1U << p.plan.ranks) - 1U;
+  uint32_t fullMask =
+      p.plan.ranks == 32 ? 0xffffffffU : (1U << p.plan.ranks) - 1U;
   bool perSource = p.agPerSourceProgress && p.gpuProgress &&
                    p.plan.transform == PacketTransform::Copy &&
                    p.plan.layout == PacketLayout::Concatenate &&
                    p.plan.sources == fullMask &&
-                   p.plan.destinations == fullMask &&
-                   blocks >= p.plan.ranks;
+                   p.plan.destinations == fullMask && blocks >= p.plan.ranks;
   for (size_t tile = firstTile; tile < endTile; ++tile) {
     int slot = tile & 1;
     uint32_t seq = p.firstSequence + tile;
@@ -389,28 +443,28 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
               __nanosleep(64);
           releaseGpu(&state->sourceReady[owner], seq);
         } else
-          while (acquireGpu(&state->sourceReady[owner]) < seq)
-            __nanosleep(64);
+          while (acquireGpu(&state->sourceReady[owner]) < seq) __nanosleep(64);
       }
       __syncthreads();
       if (p.profile && tile == 0 && block == 0 && threadIdx.x == 0)
         state->times[3] = timer();
       size_t packetUnits =
-          min(p.packetElements,
-              p.plan.inputElements - tile * p.packetElements);
-      if (vector) packetUnits /= 8;
+          min(p.packetElements, p.plan.inputElements - tile * p.packetElements);
+      if (vector) packetUnits /= vectorElements;
       auto route = p.plan.outputRoute(p.rank, tile, p.packetElements, owner);
       int groupBlock = block / p.plan.ranks;
       int groupBlocks = (blocks - 1 - owner) / p.plan.ranks + 1;
       if (!(p.gatherLocalReady && route.local))
         for (size_t i = size_t(groupBlock) * blockDim.x + threadIdx.x;
              i < packetUnits; i += size_t(groupBlocks) * blockDim.x) {
-          size_t index = vector ? i * 8 : i;
+          size_t index = vector ? i * vectorElements : i;
           uint16_t const* from =
               route.local ? p.input + route.sourceOffset + index
                           : p.sources[slot][owner] + route.sourceOffset + index;
           uint16_t* to = p.output + route.outputOffset + index;
-          if (vector)
+          if (wide)
+            DeviceChannel::put32(to, DeviceChannel::get32(from));
+          else if (vector)
             DeviceChannel::put16(to, DeviceChannel::get16(from));
           else
             DeviceChannel::put2(to, DeviceChannel::get2(from));
@@ -454,13 +508,13 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
     size_t packetUnits =
         vector ? min(p.packetElements,
                      p.plan.inputElements - tile * p.packetElements) /
-                     8
+                     vectorElements
                : min(p.packetElements,
                      p.plan.inputElements - tile * p.packetElements);
     size_t totalUnits = concatenate ? packetUnits * p.plan.ranks : 0;
     auto single = reductionRoute(p, tile);
     if (!concatenate)
-      totalUnits = vector ? single.elements / 8 : single.elements;
+      totalUnits = vector ? single.elements / vectorElements : single.elements;
     for (size_t flat = thread; flat < totalUnits; flat += stride) {
       int owner = concatenate ? int(flat / packetUnits) : 0;
       auto route = concatenate ? p.plan.outputRoute(p.rank, tile,
@@ -470,17 +524,22 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
       if (!route.elements) continue;
       if (p.gatherLocalReady && route.local) continue;
       size_t i = concatenate ? flat % packetUnits : flat;
-      size_t index = vector ? i * 8 : i;
+      size_t index = vector ? i * vectorElements : i;
       size_t target = route.outputOffset + index;
-      if (p.gpuReduce) {
+      if (gpuReduce) {
         size_t offset = route.sourceOffset + index;
         size_t global = p.interleaveScatter ? route.retainedOffset + index
                                             : tile * p.packetElements + offset;
-        auto value = sumPacket8(p, slot, offset, global, vector);
-        if (vector)
-          DeviceChannel::put16(p.output + target, value);
-        else
-          DeviceChannel::put2(p.output + target, uint16_t(value.x));
+        if (wide)
+          DeviceChannel::put32(p.output + target,
+                               sumPacket16(p, slot, offset, global));
+        else {
+          auto value = sumPacket8(p, slot, offset, global, vector);
+          if (vector)
+            DeviceChannel::put16(p.output + target, value);
+          else
+            DeviceChannel::put2(p.output + target, uint16_t(value.x));
+        }
         continue;
       }
       uint16_t const* from =
@@ -488,7 +547,16 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
           : route.local
               ? p.input + route.sourceOffset + index
               : p.sources[slot][route.sourceRank] + route.sourceOffset + index;
-      if (vector) {
+      if (wide) {
+        auto routed = DeviceChannel::get32(from);
+        if (route.addRetained) {
+          auto own =
+              DeviceChannel::get32(p.input + route.retainedOffset + index);
+          routed.lo = finishVector(routed.lo, own.lo);
+          routed.hi = finishVector(routed.hi, own.hi);
+        }
+        DeviceChannel::put32(p.output + target, routed);
+      } else if (vector) {
         uint4 routed = DeviceChannel::get16(from);
         if (route.addRetained) {
           uint4 own =
@@ -514,7 +582,7 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
       releaseSys(&p.flags->consumed[slot][p.rank].value, seq);
       if (p.gpuProgress)
         releaseSys(&p.readerFlags->readers[slot][p.rank].value, seq);
-      else if ((p.plan.transform == PacketTransform::Copy || p.gpuReduce) &&
+      else if ((p.plan.transform == PacketTransform::Copy || gpuReduce) &&
                (p.plan.destinations & (1U << p.rank)))
         DevicePacketOwnership{{&p.flags->routed[slot][p.rank]},
                               {&p.flags->released[slot][p.rank]},
@@ -524,6 +592,7 @@ __device__ void runTransport(Transport const& p, size_t firstTile,
   }
   if (p.profile && block == 0 && threadIdx.x == 0) state->times[5] = timer();
 }
+template <int GpuReduction = -1, int VectorBytes = 0>
 __global__ void dispatchTransport(Command const* commands, Dispatch* dispatch,
                                   size_t firstTile = 0, size_t endTile = 0,
                                   bool finalEpoch = true) {
@@ -544,7 +613,16 @@ __global__ void dispatchTransport(Command const* commands, Dispatch* dispatch,
   auto const& p = *reinterpret_cast<Transport*>(storage);
   if (!endTile)
     endTile = (p.plan.inputElements + p.packetElements - 1) / p.packetElements;
-  runTransport(p, firstTile, endTile);
+  if (gridDim.x == 1) {
+    // Both logical crews have one CTA. Completing each read before beginning
+    // the next upload preserves slot credits without a software grid barrier.
+    for (size_t tile = firstTile; tile < endTile; ++tile) {
+      runTransport<GpuReduction, VectorBytes>(p, tile, tile + 1, 0);
+      runTransport<GpuReduction, VectorBytes>(p, tile, tile + 1,
+                                              p.producerBlocks);
+    }
+  } else
+    runTransport<GpuReduction, VectorBytes>(p, firstTile, endTile);
   __syncthreads();
   if (threadIdx.x == 0 &&
       atomicAdd(&dispatch->finishedBlocks, 1) == gridDim.x - 1) {
@@ -557,6 +635,13 @@ __global__ void dispatchTransport(Command const* commands, Dispatch* dispatch,
                    : "memory");
     }
   }
+}
+void* transportKernel(bool gpuReduction, int vectorBytes) {
+  if (vectorBytes == 32)
+    return gpuReduction ? reinterpret_cast<void*>(dispatchTransport<1, 32>)
+                        : reinterpret_cast<void*>(dispatchTransport<0, 32>);
+  return gpuReduction ? reinterpret_cast<void*>(dispatchTransport<1, 16>)
+                      : reinterpret_cast<void*>(dispatchTransport<0, 16>);
 }
 struct ResidentRouterDispatch {
   static constexpr bool kEnabled = true;
@@ -731,9 +816,7 @@ struct ResidentGemm : ResidentProducer {
     }
   }
   int gridLimit(int rank) const override { return gridLimits[rank]; }
-  bool decodeGather() const override {
-    return contributionElements && m <= 64;
-  }
+  bool decodeGather() const override { return contributionElements && m <= 64; }
   bool matches(PacketProgram const& plan, int rank, void const* input,
                void const* output) const override {
     if (contributionElements)
@@ -823,8 +906,8 @@ struct ResidentGemm : ResidentProducer {
           throw std::invalid_argument("AG GEMM requires transport");
         p.input_packet_elements = packetElements;
         if (!p.dispatcher_join)
-          CUDA(cudaMemsetAsync(arrivalFlags[rank].data(), 0,
-                               sizeof(uint32_t), stream));
+          CUDA(cudaMemsetAsync(arrivalFlags[rank].data(), 0, sizeof(uint32_t),
+                               stream));
         // Make this rank's complete rows valid before any worker can read them.
         // The dispatcher omits its local slice, so it cannot race these reads.
         if (p.dispatcher.gatherLocalReady)
@@ -1070,6 +1153,7 @@ struct PacketPipeline::Impl {
   std::array<GridState*, kMaxRanks> grids{};
   std::array<std::array<uint32_t, 2>, kMaxRanks> barrierPhases{};
   std::array<RegisteredMemory, kMaxRanks> deviceGrids, deviceDispatch;
+  std::array<RegisteredMemory, kMaxRanks> deviceSources, devicePeerFlags;
   std::array<RegisteredMemory, kMaxRanks> dmaState, dmaRetained;
   std::array<std::unique_ptr<Channel>, kMaxRanks> channels;
   std::array<cudaStream_t, kMaxRanks> uploadStreams{}, downloadStreams{};
@@ -1081,7 +1165,8 @@ struct PacketPipeline::Impl {
   std::array<Dispatch*, kMaxRanks> dispatches{};
   std::array<Command*, kMaxRanks> mappedCommands{};
   std::array<RegisteredMemory, kMaxRanks> commandMemory, completionMemory;
-  std::array<std::array<cudaGraphExec_t, 256>, kMaxRanks> graphs{};
+  using TransportGraphs = std::array<cudaGraphExec_t, kMaxTransportBlocks + 1>;
+  std::array<std::array<TransportGraphs, 2>, kMaxRanks> graphs{};
   std::array<cudaStream_t, kMaxRanks> streams{};
   std::array<Flags*, kMaxRanks> mappedFlags{};
   std::array<Flags*, kMaxRanks> mappedReaderFlags{};
@@ -1090,7 +1175,14 @@ struct PacketPipeline::Impl {
       mappedOutputs{};
   uint16_t* mappedSources[kMaxRanks][kSlots][kMaxRanks]{};
   std::array<int, kMaxRanks> devices{}, maxBlocks{};
+  std::array<std::array<int, 2>, kMaxRanks> maxBlocksByKind{};
   std::unique_ptr<CpuExecutor> executor;
+  std::unique_ptr<CpuExecutor> launchExecutor;
+  std::vector<std::vector<int>> launchRanks;
+  std::vector<size_t> launchLanes;
+  std::array<cudaGraphExec_t, kMaxRanks> launchGraphs{};
+  std::array<std::atomic<bool>, kMaxRanks> launchDone{};
+  std::array<std::exception_ptr, kMaxRanks> launchErrors{};
 
   std::array<JobSlot, kQueueDepth> queue;
   std::mutex queueMutex;
@@ -1130,8 +1222,11 @@ struct PacketPipeline::Impl {
         options.backend != TransportBackend::GpuKernel)
       throw std::invalid_argument("GPU reduction requires the SM transport");
     if (options.interleaveScatter &&
-        options.reduction != ReductionPlacement::Gpu)
-      throw std::invalid_argument("interleaved scatter requires GPU reduction");
+        (options.backend != TransportBackend::GpuKernel ||
+         (options.reduction == ReductionPlacement::Cpu &&
+          options.concurrentProducer)))
+      throw std::invalid_argument(
+          "interleaved scatter requires standalone SM transport");
     if (options.gpuProgress && options.reduction != ReductionPlacement::Gpu)
       throw std::invalid_argument("GPU progress requires GPU reduction");
     if (options.agPerSourceProgress && !options.gpuProgress)
@@ -1140,12 +1235,19 @@ struct PacketPipeline::Impl {
         options.packetBytes % 16 || options.minPacketBytes < 16 ||
         options.minPacketBytes > options.packetBytes ||
         options.minPacketBytes % 16 || options.transportBlocks < 2 ||
-        options.transportBlocks >= 256 || options.transportThreads < 32 ||
-        options.transportThreads > 1024 || options.transportThreads % 256 ||
+        options.transportBlocks > kMaxTransportBlocks ||
+        options.transportThreads < 32 || options.transportThreads > 1024 ||
+        options.transportThreads % 32 ||
+        (options.transportVectorBytes != 16 &&
+         options.transportVectorBytes != 32) ||
         options.fusedTransportCrew < 0 || options.fusedTransportCrew > 127 ||
         options.workersPerNode < 1 || options.workersPerNode > 63 ||
         options.scatterWorkersPerNode < 0 ||
         options.scatterWorkersPerNode > 63 || !options.grainElements ||
+        options.smallReduceScatterWorkersPerNode < 0 ||
+        options.smallReduceScatterWorkersPerNode > 63 ||
+        options.gpuLaunchWorkersPerNode < 0 ||
+        options.gpuLaunchWorkersPerNode > kMaxRanks ||
         options.transportGrainBytes < 16)
       throw std::invalid_argument("invalid CPU router options");
     if (!__builtin_cpu_supports("avx2"))
@@ -1159,6 +1261,11 @@ struct PacketPipeline::Impl {
     if (!options.numaNodes.empty() && options.numaNodes.size() != ports.size())
       throw std::invalid_argument("NUMA override count mismatch");
     for (int rank = 0; rank < ranks; ++rank) {
+      if (options.gpuLaunchWorkersPerNode &&
+          (!ports[rank].stream || ports[rank].stream == cudaStreamPerThread))
+        throw std::invalid_argument(
+            "parallel GPU launch requires explicit streams or "
+            "cudaStreamLegacy");
       for (int peer = 0; peer < rank; ++peer)
         if (ports[rank].device == ports[peer].device)
           throw std::invalid_argument("duplicate router device");
@@ -1230,6 +1337,32 @@ struct PacketPipeline::Impl {
                 std::find(allowed.begin(), allowed.end(), options.replayCpu) ==
                     allowed.end()))
       throw std::invalid_argument("invalid replay CPU");
+    std::vector<int> launchCpus;
+    if (options.gpuLaunchWorkersPerNode && ranks > 1) {
+      for (int node = 0; node < nodes; ++node) {
+        size_t count = std::min<size_t>(options.gpuLaunchWorkersPerNode,
+                                        groupRanks[node].size());
+        size_t begin = launchCpus.size();
+        for (auto cpu = nodeCpus[node].rbegin();
+             cpu != nodeCpus[node].rend() && launchCpus.size() < begin + count;
+             ++cpu)
+          if (*cpu != options.replayCpu &&
+              (options.gpuLaunchAllowedCpus.empty() ||
+               std::find(options.gpuLaunchAllowedCpus.begin(),
+                         options.gpuLaunchAllowedCpus.end(),
+                         *cpu) != options.gpuLaunchAllowedCpus.end()) &&
+              std::find(options.workerCpus.begin(), options.workerCpus.end(),
+                        *cpu) == options.workerCpus.end())
+            launchCpus.push_back(*cpu);
+        if (launchCpus.size() != begin + count)
+          throw std::invalid_argument(
+              "not enough spare NUMA-local CPUs for GPU launch workers");
+        launchRanks.resize(begin + count);
+        for (size_t r = 0; r < groupRanks[node].size(); ++r)
+          launchRanks[begin + r % count].push_back(groupRanks[node][r]);
+      }
+      for (size_t i = 0; i < launchCpus.size(); ++i) launchLanes.push_back(i);
+    }
     flagMemory.resize(nodes);
     flags.resize(nodes);
     CUDA(cudaSetDevice(ports[0].device));
@@ -1277,21 +1410,31 @@ struct PacketPipeline::Impl {
                                   devices[rank]));
       if (options.backend == TransportBackend::GpuKernel && !cooperative)
         throw std::runtime_error("kernel router requires cooperative GPUs");
-      int active, sms;
-      CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &active, dispatchTransport, options.transportThreads, 0));
+      int sms;
       CUDA(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                                   devices[rank]));
-      maxBlocks[rank] = std::min(options.transportBlocks, active * sms);
-      if (options.concurrentProducer) {
-        // Keep the entire software-barrier grid resident and leave two SMs
-        // available even for a producer CTA too large to share a transport SM.
-        if (sms < 4)
-          throw std::runtime_error(
-              "concurrent transport requires at least four SMs");
-        maxBlocks[rank] = std::min(maxBlocks[rank], sms - 2);
+      for (int kind = 0; kind < 2; ++kind) {
+        int active;
+        CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active,
+            options.concurrentProducer
+                ? reinterpret_cast<void*>(dispatchTransport<>)
+                : transportKernel(kind, options.transportVectorBytes),
+            options.transportThreads, 0));
+        int limit = std::min(options.transportBlocks, active * sms);
+        if (options.concurrentProducer) {
+          // Leave two SMs for an independent producer, as in the generic
+          // transport. Concurrent launches still use its shared dispatcher.
+          if (sms < 4)
+            throw std::runtime_error(
+                "concurrent transport requires at least four SMs");
+          limit = std::min(limit, sms - 2);
+        }
+        maxBlocksByKind[rank][kind] = limit;
       }
-      if (!maxBlocks[rank])
+      maxBlocks[rank] =
+          maxBlocksByKind[rank][options.reduction == ReductionPlacement::Gpu];
+      if (!maxBlocksByKind[rank][0] && !maxBlocksByKind[rank][1])
         throw std::runtime_error("no resident transport blocks");
       deviceGrids[rank] =
           RegisteredMemory::gpu(sizeof(GridState) * 2, devices[rank]);
@@ -1359,6 +1502,23 @@ struct PacketPipeline::Impl {
             reinterpret_cast<void**>(&mappedOutputs[slot][rank]),
             outputs[slot][rankGroup[rank]].data(), 0));
       }
+      // These port mappings never change after prepare. Keep them on-device
+      // instead of transferring all 32-rank pointer tables with every command.
+      std::array<std::array<uint16_t const*, kMaxRanks>, kSlots> sourceTable{};
+      for (int slot = 0; slot < kSlots; ++slot)
+        for (int owner = 0; owner < ranks; ++owner)
+          sourceTable[slot][owner] = mappedSources[rank][slot][owner];
+      deviceSources[rank] =
+          RegisteredMemory::gpu(sizeof(sourceTable), devices[rank]);
+      CUDA(cudaMemcpy(deviceSources[rank].data(), sourceTable.data(),
+                      sizeof(sourceTable), cudaMemcpyHostToDevice));
+      if (options.gpuProgress) {
+        devicePeerFlags[rank] =
+            RegisteredMemory::gpu(sizeof(mappedPeerFlags[rank]), devices[rank]);
+        CUDA(cudaMemcpy(devicePeerFlags[rank].data(),
+                        mappedPeerFlags[rank].data(),
+                        sizeof(mappedPeerFlags[rank]), cudaMemcpyHostToDevice));
+      }
     }
     for (int group = 0; group < nodes; ++group) {
       std::fprintf(stderr, "# NUMA group%d host_node=%d ranks=", group,
@@ -1376,6 +1536,13 @@ struct PacketPipeline::Impl {
                  ranks, nodes);
     if (!options.gpuProgress)
       executor = std::make_unique<CpuExecutor>(options.workerCpus);
+    if (!launchCpus.empty()) {
+      launchExecutor =
+          std::make_unique<CpuExecutor>(launchCpus, kQueueDepth, 2000);
+      std::fprintf(stderr, "# GPU launch workers=%zu CPUs=", launchCpus.size());
+      for (int cpu : launchCpus) std::fprintf(stderr, "%d,", cpu);
+      std::fprintf(stderr, "\n");
+    }
     std::fprintf(stderr, "# packet_progress=%s routing_cpu_workers=%zu\n",
                  options.gpuProgress ? "gpu" : "cpu",
                  options.gpuProgress ? size_t(0) : options.workerCpus.size());
@@ -1423,6 +1590,7 @@ struct PacketPipeline::Impl {
       stopping.store(true, std::memory_order_release);
     }
     if (executor) executor->stop();
+    if (launchExecutor) launchExecutor->stop();
     if (ranks == 1) {
       cudaSetDevice(devices[0]);
       for (auto event : singleDone)
@@ -1439,8 +1607,9 @@ struct PacketPipeline::Impl {
       }
     for (int rank = 0; rank < ranks; ++rank) {
       cudaSetDevice(devices[rank]);
-      for (auto graph : graphs[rank])
-        if (graph) cudaGraphExecDestroy(graph);
+      for (auto const& kind : graphs[rank])
+        for (auto graph : kind)
+          if (graph) cudaGraphExecDestroy(graph);
     }
   }
   void waitGpu(Word const& word, uint32_t seq) {
@@ -1463,6 +1632,8 @@ struct PacketPipeline::Impl {
     // unfused call. Size scratch for that wider range in either order.
     int configuredWorkers = workers;
     workers = std::min(workers, 8);
+    if (options.smallReduceScatterWorkersPerNode)
+      workers = std::min(workers, options.smallReduceScatterWorkersPerNode);
     size_t rowElements = std::min(
         capacity,
         std::max((capacity + workers - 1) / workers, options.grainElements));
@@ -1475,8 +1646,9 @@ struct PacketPipeline::Impl {
       for (int node = 0; node < nodes; ++node) {
         scatterPartials[slot][node].allocate(
             scatterStride * 2 * options.workersPerNode, nodeIds[node], false);
-        scatterTemporary[slot][node].allocate(
-            scatterStride * 2 * options.workersPerNode, nodeIds[node], false);
+        if (!options.directScatterResults)
+          scatterTemporary[slot][node].allocate(
+              scatterStride * 2 * options.workersPerNode, nodeIds[node], false);
       }
     }
     std::fprintf(stderr,
@@ -1501,12 +1673,131 @@ struct PacketPipeline::Impl {
     for (int r : groupRanks[node]) local |= mask & (1U << r);
     return local;
   }
+  bool striped(PacketProgram const& plan) const {
+    return options.interleaveScatter && plan.layout == PacketLayout::Scatter;
+  }
+  size_t packetExtent(Job const& job, size_t tile) const {
+    return striped(job.plan)
+               ? job.packetElements
+               : std::min(job.packetElements,
+                          job.plan.inputElements - tile * job.packetElements);
+  }
+  // Split a CPU lane at destination boundaries and at the valid tail of each
+  // stripe. Packet offsets are shared with GPU upload/reductionRoute.
+  size_t rangeEnd(Job const& job, size_t tile, size_t i, size_t hi,
+                  int& destination, bool& valid) const {
+    valid = true;
+    destination = -1;
+    if (job.plan.layout != PacketLayout::Scatter) return hi;
+    size_t shard = job.plan.inputElements / ranks;
+    if (!striped(job.plan)) {
+      size_t begin = tile * job.packetElements;
+      destination = int((begin + i) / shard);
+      return std::min(hi, size_t(destination + 1) * shard - begin);
+    }
+    size_t stripe = job.packetElements / ranks;
+    size_t length = std::min(stripe, shard - tile * stripe);
+    destination = int(i / stripe);
+    size_t end = size_t(destination) * stripe + length;
+    if (i >= end) {
+      valid = false;
+      end = size_t(destination + 1) * stripe;
+    }
+    return std::min(hi, end);
+  }
+  uint32_t packetDestinations(Job const& job, size_t tile, size_t lo,
+                              size_t hi) const {
+    if (!striped(job.plan)) {
+      size_t begin = tile * job.packetElements;
+      return destinations(job.plan, begin + lo, begin + hi);
+    }
+    uint32_t mask = 0;
+    for (size_t i = lo; i < hi;) {
+      int destination;
+      bool valid;
+      i = rangeEnd(job, tile, i, hi, destination, valid);
+      if (valid) mask |= job.plan.destinations & (1U << destination);
+    }
+    return mask;
+  }
+  // One-NUMA CPU reduction does not need an intermediate partial or merge.
+  // Wait for the previous result's readers before overwriting its slot, then
+  // publish upload credit only after every CPU lane has finished reading.
+  void reduceSingleNuma(Job const& job, int lane) {
+    auto previousResults = job.previousResults[0];
+    auto previousConsumers = job.previousConsumers[0];
+    for (size_t tile = 0; tile < job.tiles; ++tile) {
+      int slot = tile & 1;
+      uint32_t seq = job.sequence + tile;
+      for (int peer : groupRanks[0])
+        waitGpu(flags[0]->uploaded[slot][peer], seq);
+      size_t n = packetExtent(job, tile);
+      size_t width = (n + job.active - 1) / job.active;
+      size_t lo = std::min(n, size_t(lane) * width);
+      size_t hi = std::min(n, lo + width);
+      uint32_t consumers = packetDestinations(job, tile, 0, n);
+      if (consumers && lo < hi) {
+        TimelineRange wait("packet.wait_consumers", seq, lane == 0);
+        if (previousResults[slot])
+          for (int peer : groupRanks[0])
+            if (previousConsumers[slot] & (1U << peer))
+              waitGpu(flags[0]->consumed[slot][peer], previousResults[slot]);
+      }
+      {
+        TimelineRange math("cpu.direct_bf16", seq, lane == 0);
+        size_t i = lo;
+        while (i < hi) {
+          bool scatter = job.plan.layout == PacketLayout::Scatter;
+          int excluded;
+          bool valid;
+          size_t end = rangeEnd(job, tile, i, hi, excluded, valid);
+          if (valid && (!scatter || (consumers & (1U << excluded)))) {
+            std::array<MemorySpan, kMaxRanks> sources;
+            size_t count = 0;
+            for (int peer : groupRanks[0])
+              if ((job.plan.sources & (1U << peer)) && peer != excluded)
+                sources[count++] = MemorySpan::borrowedPinned(
+                    static_cast<uint16_t*>(inputs[slot][peer].data()) + i,
+                    (end - i) * 2, nodeIds[0]);
+            RouterCore::process(
+                sources.data(), count,
+                MemorySpan::borrowedPinned(
+                    static_cast<uint16_t*>(outputs[slot][0].data()) + i,
+                    (end - i) * 2, nodeIds[0]));
+          }
+          i = end;
+        }
+      }
+      SignalRef{&localReady[slot][lane]}.publish(seq);
+      if (lane == 0) {
+        for (int peer : groupRanks[0])
+          PacketOwnershipView{{&flags[0]->uploaded[slot][peer]},
+                              {&flags[0]->released[slot][peer]},
+                              localReady[slot].get(),
+                              (1ULL << job.active) - 1}
+              .release(seq);
+        for (int peer : groupRanks[0])
+          if (job.plan.layout != PacketLayout::Scatter ||
+              (consumers & (1U << peer)))
+            cpuRelease(flags[0]->routed[slot][peer], seq);
+      }
+      if (consumers) {
+        previousResults[slot] = seq;
+        previousConsumers[slot] = consumers;
+      }
+    }
+  }
   // forward uploads -> process NUMA-local partials and merge -> multicast the
   // immutable result. Both transports share this CPU schedule and its credits.
   void routePackets(Job const& job, int worker) {
+    if (nodes == 1 && options.singleNumaReduction &&
+        job.plan.transform == PacketTransform::Sum &&
+        options.reduction == ReductionPlacement::Cpu) {
+      reduceSingleNuma(job, worker);
+      return;
+    }
     int node = worker / options.workersPerNode,
         lane = worker % options.workersPerNode;
-    size_t capacity = job.packetElements;
     auto previousResults = job.previousResults[node];
     auto previousConsumers = job.previousConsumers[node];
     for (size_t tile = 0; tile < job.tiles; ++tile) {
@@ -1539,8 +1830,7 @@ struct PacketPipeline::Impl {
           if (owner != node && (lastReaders[worker][slot] & (1U << owner)))
             waitCpu(readDone[slot][owner * options.workersPerNode + lane],
                     lastPartial[worker][slot]);
-      size_t begin = tile * capacity,
-             n = std::min(capacity, job.plan.inputElements - begin);
+      size_t n = packetExtent(job, tile);
       {
         TimelineRange trace("packet.wait_upload", seq, lane == 0);
         for (int peer : groupRanks[node])
@@ -1559,13 +1849,13 @@ struct PacketPipeline::Impl {
         TimelineRange trace("cpu.local_bf16", seq, lane == 0);
         size_t i = lo;
         while (i < hi) {
-          size_t shard = job.plan.inputElements / ranks;
-          int excluded = job.plan.layout == PacketLayout::Scatter
-                             ? int((begin + i) / shard)
-                             : -1;
-          size_t end = excluded >= 0
-                           ? std::min(hi, size_t(excluded + 1) * shard - begin)
-                           : hi;
+          int excluded;
+          bool valid;
+          size_t end = rangeEnd(job, tile, i, hi, excluded, valid);
+          if (!valid) {
+            i = end;
+            continue;
+          }
           std::array<MemorySpan, kMaxRanks> sourceSpans;
           size_t count = 0;
           for (int peer : groupRanks[node])
@@ -1589,11 +1879,11 @@ struct PacketPipeline::Impl {
               localReady[slot].get() + node * options.workersPerNode,
               (1ULL << job.active) - 1}
               .release(seq);
-      uint32_t consumers = destinations(job.plan, begin, begin + n);
+      uint32_t consumers = packetDestinations(job, tile, 0, n);
       uint32_t localConsumers = nodeDestinations(consumers, node);
       uint32_t readers = 0;
       if (job.plan.layout == PacketLayout::Scatter) {
-        uint32_t laneConsumers = destinations(job.plan, begin + lo, begin + hi);
+        uint32_t laneConsumers = packetDestinations(job, tile, lo, hi);
         for (int r = 0; r < ranks; ++r)
           if (laneConsumers & (1U << r)) readers |= 1U << rankGroup[r];
       } else {
@@ -1601,8 +1891,17 @@ struct PacketPipeline::Impl {
       }
       bool writesResult =
           job.plan.layout != PacketLayout::Scatter || localConsumers;
-      uint16_t* tmp = static_cast<uint16_t*>(temporaryBanks[node].data()) +
-                      lane * (scatter ? scatterStride : temporaryStride);
+      bool direct = scatter && options.directScatterResults;
+      uint16_t* tmp =
+          direct ? static_cast<uint16_t*>(outputs[slot][node].data()) + lo
+                 : static_cast<uint16_t*>(temporaryBanks[node].data()) +
+                       lane * (scatter ? scatterStride : temporaryStride);
+      if (direct && writesResult && lo < hi && previousResults[slot]) {
+        TimelineRange trace("packet.wait_consumers", seq, lane == 0);
+        for (int peer : groupRanks[node])
+          if (previousConsumers[slot] & (1U << peer))
+            waitGpu(flags[node]->consumed[slot][peer], previousResults[slot]);
+      }
       // Every source group produces its local partial. Only the destination
       // group reads those partials and performs the final BF16 merge.
       if (readers & (1U << node)) {
@@ -1614,15 +1913,13 @@ struct PacketPipeline::Impl {
         TimelineRange math("cpu.merge_bf16", seq, lane == 0);
         size_t i = lo;
         while (i < hi) {
-          size_t end = hi;
-          bool owned = true;
-          if (job.plan.layout == PacketLayout::Scatter) {
-            size_t shard = job.plan.inputElements / ranks;
-            int destination = int((begin + i) / shard);
-            end = std::min(hi, size_t(destination + 1) * shard - begin);
-            owned = (job.plan.destinations & (1U << destination)) &&
-                    rankGroup[destination] == node;
-          }
+          int destination;
+          bool valid;
+          size_t end = rangeEnd(job, tile, i, hi, destination, valid);
+          bool owned =
+              valid &&
+              (!scatter || ((job.plan.destinations & (1U << destination)) &&
+                            rankGroup[destination] == node));
           if (owned) {
             if (nodes == 1)
               RouterCore::forward({tmp + i - lo,
@@ -1664,7 +1961,7 @@ struct PacketPipeline::Impl {
       // this lane's partial. Publish even on empty lanes to keep generations
       // monotonic; their source reader mask is empty.
       SignalRef{&readDone[slot][worker]}.publish(seq);
-      if (writesResult && lo < hi) {
+      if (!direct && writesResult && lo < hi) {
         TimelineRange trace("packet.wait_consumers", seq, lane == 0);
         if (previousResults[slot])
           for (int peer : groupRanks[node])
@@ -1672,15 +1969,13 @@ struct PacketPipeline::Impl {
               waitGpu(flags[node]->consumed[slot][peer], previousResults[slot]);
         size_t i = lo;
         while (i < hi) {
-          size_t end = hi;
-          bool owned = true;
-          if (job.plan.layout == PacketLayout::Scatter) {
-            size_t shard = job.plan.inputElements / ranks;
-            int destination = int((begin + i) / shard);
-            end = std::min(hi, size_t(destination + 1) * shard - begin);
-            owned = (job.plan.destinations & (1U << destination)) &&
-                    rankGroup[destination] == node;
-          }
+          int destination;
+          bool valid;
+          size_t end = rangeEnd(job, tile, i, hi, destination, valid);
+          bool owned =
+              valid &&
+              (!scatter || ((job.plan.destinations & (1U << destination)) &&
+                            rankGroup[destination] == node));
           if (owned)
             RouterCore::forward(
                 {static_cast<uint16_t*>(outputs[slot][node].data()) + i,
@@ -1733,6 +2028,34 @@ struct PacketPipeline::Impl {
       slot->readers.fetch_sub(1, std::memory_order_release);
     }
     owner->credit.notify_one();
+  }
+  static void launchGpuGraphs(void* context, int lane) {
+    auto& owner = *static_cast<Impl*>(context);
+    TimelineRange trace("packet.gpu_launch_lane", lane);
+    try {
+      for (int rank : owner.launchRanks[lane]) {
+        CUDA(cudaSetDevice(owner.devices[rank]));
+        CUDA(cudaGraphLaunch(owner.launchGraphs[rank], owner.streams[rank]));
+      }
+    } catch (...) {
+      owner.launchErrors[lane] = std::current_exception();
+    }
+    owner.launchDone[lane].store(true, std::memory_order_release);
+  }
+  void launchGpuBatch() {
+    TimelineRange trace("packet.gpu_launch_batch", published);
+    for (size_t lane : launchLanes) {
+      launchErrors[lane] = nullptr;
+      launchDone[lane].store(false, std::memory_order_relaxed);
+    }
+    launchExecutor->enqueueBatch(launchLanes.data(), launchLanes.size(),
+                                 launchGpuGraphs, this);
+    // Return only after every CUDA launch API has returned, preserving caller
+    // stream ordering for events or kernels immediately following enqueue.
+    for (size_t lane : launchLanes)
+      while (!launchDone[lane].load(std::memory_order_acquire)) _mm_pause();
+    for (size_t lane : launchLanes)
+      if (launchErrors[lane]) std::rethrow_exception(launchErrors[lane]);
   }
   void submit(PacketProgram const& plan, std::vector<PacketPort> const& ports,
               bool publishOnly = false,
@@ -1790,6 +2113,9 @@ struct PacketPipeline::Impl {
       if ((plan.destinations & (1U << rank)) && !ports[rank].output)
         throw std::invalid_argument("null router output");
       if (!publishOnly) {
+        // Default/legacy streams refer to the current device. Keep capture
+        // validation here, before any command or CPU callback is published.
+        CUDA(cudaSetDevice(ports[rank].device));
         cudaStreamCaptureStatus status;
         CUDA(cudaStreamIsCapturing(ports[rank].stream, &status));
         if (status != cudaStreamCaptureStatusNone && !recording)
@@ -1833,8 +2159,11 @@ struct PacketPipeline::Impl {
           "GPU reduction has not been validated with resident GEMM");
     bool gpuReduce = plan.transform == PacketTransform::Sum &&
                      options.reduction == ReductionPlacement::Gpu;
-    bool interleaveScatter = gpuReduce && options.interleaveScatter &&
-                             plan.layout == PacketLayout::Scatter;
+    bool interleaveScatter =
+        options.interleaveScatter && plan.layout == PacketLayout::Scatter;
+    if (interleaveScatter && fusedGemm)
+      throw std::invalid_argument(
+          "interleaved scatter does not support resident GEMM");
     if (interleaveScatter && binding && binding->producerElements)
       throw std::invalid_argument(
           "interleaved scatter cannot use flat producer-event stripes");
@@ -1861,18 +2190,28 @@ struct PacketPipeline::Impl {
       throw std::runtime_error("router sequence exhausted");
     uint32_t first = sequence;
     size_t work = std::min(capacity, plan.inputElements);
+    size_t tensorBytes = plan.inputElements * multiplier;
+    bool singleCta = options.singleCtaBytes &&
+                     tensorBytes <= options.singleCtaBytes && !fusedGemm &&
+                     !options.concurrentProducer &&
+                     options.backend == TransportBackend::GpuKernel;
+    int kernelKind = int(gpuReduce);
+    void* kernel = transportKernel(gpuReduce, options.transportVectorBytes);
     std::array<int, kMaxRanks> producerBlocks{}, consumerBlocks{};
     for (int rank = 0; rank < ranks; ++rank) {
+      int limit =
+          fusedGemm ? maxBlocks[rank] : maxBlocksByKind[rank][kernelKind];
+      if (limit < (singleCta ? 1 : 2))
+        throw std::runtime_error("no resident grid for this transport variant");
       int crew = fusedGemm
-                     ? residentTransportCrew(maxBlocks[rank], work,
-                                             plan.inputElements, plan.layout,
-                                             options.packetBytes,
+                     ? residentTransportCrew(limit, work, plan.inputElements,
+                                             plan.layout, options.packetBytes,
                                              options.fusedTransportCrew)
-                     : std::max(1, maxBlocks[rank] / 2);
+                     : std::max(1, limit / 2);
       if (fusedGemm && gemm->decodeGather() &&
           plan.layout == PacketLayout::Concatenate &&
           !options.fusedTransportCrew)
-        crew = maxBlocks[rank];
+        crew = limit;
       size_t egress = plan.layout == PacketLayout::Concatenate ? work * ranks
                       : plan.layout == PacketLayout::Scatter
                           ? std::min(work, plan.inputElements / ranks)
@@ -1885,8 +2224,7 @@ struct PacketPipeline::Impl {
                                   options.transportGrainBytes));
       if (fusedGemm && gemm->decodeGather() &&
           plan.layout == PacketLayout::Concatenate)
-        producerBlocks[rank] =
-            std::min(producerBlocks[rank], maxBlocks[rank] - 1);
+        producerBlocks[rank] = std::min(producerBlocks[rank], limit - 1);
       consumerBlocks[rank] = std::min<size_t>(
           crew,
           std::max<size_t>(1, (egress * 2 + options.transportGrainBytes - 1) /
@@ -1894,13 +2232,13 @@ struct PacketPipeline::Impl {
       if (fusedGemm && gemm->decodeGather() &&
           plan.layout == PacketLayout::Concatenate)
         consumerBlocks[rank] =
-            std::min(consumerBlocks[rank],
-                     maxBlocks[rank] - producerBlocks[rank]);
-      int blocks = producerBlocks[rank] + consumerBlocks[rank];
-      if (blocks >= 256)
+            std::min(consumerBlocks[rank], limit - producerBlocks[rank]);
+      if (singleCta) producerBlocks[rank] = consumerBlocks[rank] = 1;
+      int blocks = singleCta ? 1 : producerBlocks[rank] + consumerBlocks[rank];
+      if (blocks > kMaxTransportBlocks)
         throw std::invalid_argument("router graph grid limit exceeded");
       if (options.backend == TransportBackend::GpuKernel &&
-          !graphs[rank][blocks]) {
+          !graphs[rank][kernelKind][blocks]) {
         if (recording || publishOnly)
           throw std::invalid_argument("warm up this geometry before capture");
         CUDA(cudaSetDevice(devices[rank]));
@@ -1912,7 +2250,7 @@ struct PacketPipeline::Impl {
         void* args[] = {&mappedCommands[rank], &dispatches[rank], &beginTile,
                         &endTile, &finalEpoch};
         cudaKernelNodeParams params{};
-        params.func = reinterpret_cast<void*>(dispatchTransport);
+        params.func = kernel;
         params.gridDim = dim3(blocks);
         params.blockDim = dim3(options.transportThreads);
         params.kernelParams = args;
@@ -1921,7 +2259,7 @@ struct PacketPipeline::Impl {
         attr.cooperative = !options.concurrentProducer;
         CUDA(cudaGraphKernelNodeSetAttribute(
             node, cudaKernelNodeAttributeCooperative, &attr));
-        CUDA(cudaGraphInstantiate(&graphs[rank][blocks], graph, 0));
+        CUDA(cudaGraphInstantiate(&graphs[rank][kernelKind][blocks], graph, 0));
         CUDA(cudaGraphDestroy(graph));
       }
     }
@@ -1949,14 +2287,14 @@ struct PacketPipeline::Impl {
         void* args[] = {&mappedCommands[rank], &dispatches[rank], &beginTile,
                         &endTile, &finalEpoch};
         if (options.concurrentProducer)
-          dispatchTransport<<<producerBlocks[rank] + consumerBlocks[rank],
-                              options.transportThreads, 0,
-                              ports[rank].stream>>>(mappedCommands[rank],
-                                                    dispatches[rank]);
+          dispatchTransport<>
+              <<<producerBlocks[rank] + consumerBlocks[rank],
+                 options.transportThreads, 0, ports[rank].stream>>>(
+                  mappedCommands[rank], dispatches[rank]);
         else
           CUDA(cudaLaunchCooperativeKernel(
-              reinterpret_cast<void*>(dispatchTransport),
-              dim3(producerBlocks[rank] + consumerBlocks[rank]),
+              kernel,
+              dim3(singleCta ? 1 : producerBlocks[rank] + consumerBlocks[rank]),
               dim3(options.transportThreads), args, 0, ports[rank].stream));
       }
       return;
@@ -1983,6 +2321,11 @@ struct PacketPipeline::Impl {
                                           options.grainElements));
     if (plan.layout == PacketLayout::Scatter && options.scatterWorkersPerNode)
       active = std::min(active, options.scatterWorkersPerNode);
+    if (plan.layout == PacketLayout::Scatter && !gpuReduce &&
+        options.smallReduceScatterWorkersPerNode &&
+        plan.inputElements * 2 >= (256UL << 10) &&
+        plan.inputElements * 2 <= (1UL << 20))
+      active = std::min(active, options.smallReduceScatterWorkersPerNode);
     if (fusedGemm && plan.layout == PacketLayout::Scatter &&
         plan.inputElements >= (1UL << 20) &&
         plan.inputElements < kShortPrefillElements)
@@ -1999,9 +2342,8 @@ struct PacketPipeline::Impl {
                   capacity, lastSequence, lastResults, lastConsumers};
       if (plan.transform == PacketTransform::Sum && !gpuReduce) {
         for (size_t tile = 0; tile < tiles; ++tile) {
-          size_t begin = tile * capacity;
-          uint32_t mask = destinations(
-              plan, begin, std::min(begin + capacity, plan.inputElements));
+          uint32_t mask = packetDestinations(slot.job, tile, 0,
+                                             packetExtent(slot.job, tile));
           for (int node = 0; node < nodes; ++node) {
             uint32_t local = nodeDestinations(mask, node);
             if (plan.layout != PacketLayout::Scatter || local) {
@@ -2017,27 +2359,40 @@ struct PacketPipeline::Impl {
       if (tiles > 1) lastSequence[1] = first + ((tiles - 2) | size_t(1));
       ++published;
     }
-    if (!options.gpuProgress)
-      for (int node = 0; node < nodes; ++node)
-        for (int i = 0; i < active; ++i)
-          RouterCore::process(*executor, node * options.workersPerNode + i,
-                              executeJob, &slot);
+    if (!options.gpuProgress) {
+      if (options.batchCpuJobs && plan.layout == PacketLayout::Scatter) {
+        size_t lanes[kMaxRanks * 63];
+        size_t count = 0;
+        for (int node = 0; node < nodes; ++node)
+          for (int i = 0; i < active; ++i)
+            lanes[count++] = size_t(node * options.workersPerNode + i);
+        executor->enqueueBatch(lanes, count, executeJob, &slot);
+      } else {
+        for (int node = 0; node < nodes; ++node)
+          for (int i = 0; i < active; ++i)
+            RouterCore::process(*executor, node * options.workersPerNode + i,
+                                executeJob, &slot);
+      }
+    }
+    bool parallelLaunch = launchExecutor && !publishOnly &&
+                          options.backend == TransportBackend::GpuKernel &&
+                          !options.concurrentProducer && !fusedGemm;
     for (int rank = 0; rank < ranks; ++rank) {
-      if (!publishOnly) CUDA(cudaSetDevice(devices[rank]));
+      if (!publishOnly && !parallelLaunch) CUDA(cudaSetDevice(devices[rank]));
       Transport p{};
       p.input = static_cast<uint16_t const*>(ports[rank].input);
       p.output = static_cast<uint16_t*>(ports[rank].output);
       for (int slot = 0; slot < 2; ++slot) {
         p.uploads[slot] = mappedInputs[slot][rank];
-        for (int owner = 0; owner < ranks; ++owner)
-          p.sources[slot][owner] = mappedSources[rank][slot][owner];
+        p.sources[slot] =
+            static_cast<uint16_t const* const*>(deviceSources[rank].data()) +
+            slot * kMaxRanks;
         p.results[slot] = mappedOutputs[slot][rank];
       }
       p.flags = mappedFlags[rank];
       p.readerFlags = mappedReaderFlags[rank];
       if (options.gpuProgress)
-        for (int owner = 0; owner < ranks; ++owner)
-          p.peerFlags[owner] = mappedPeerFlags[rank][owner];
+        p.peerFlags = static_cast<Flags* const*>(devicePeerFlags[rank].data());
       p.grid = grids[rank];
       p.plan = plan;
       p.packetElements = capacity;
@@ -2048,6 +2403,7 @@ struct PacketPipeline::Impl {
       p.interleaveScatter = interleaveScatter;
       p.gpuProgress = options.gpuProgress;
       p.agPerSourceProgress = options.agPerSourceProgress;
+      p.vectorBytes = options.transportVectorBytes;
       for (int slot = 0; slot < 2; ++slot) p.previous[slot] = previous[slot];
       p.producerBlocks = producerBlocks[rank];
       p.consumerBlocks = consumerBlocks[rank];
@@ -2057,15 +2413,19 @@ struct PacketPipeline::Impl {
             options.backend == TransportBackend::GpuKernel)
           barrierPhases[rank][crew] += uint32_t(tiles);
       }
-      int blocks = p.producerBlocks + p.consumerBlocks;
+      int blocks = singleCta ? 1 : p.producerBlocks + p.consumerBlocks;
       auto& command = static_cast<Command*>(
           commandMemory[rank].data())[ticket % kQueueDepth];
       command.payload = p;
       cpuRelease(command.ready, uint32_t(ticket + 1));
-      if (!publishOnly && options.backend == TransportBackend::GpuKernel &&
-          !options.concurrentProducer && !fusedGemm)
-        CUDA(cudaGraphLaunch(graphs[rank][blocks], ports[rank].stream));
+      if (parallelLaunch)
+        launchGraphs[rank] = graphs[rank][kernelKind][blocks];
+      else if (!publishOnly && options.backend == TransportBackend::GpuKernel &&
+               !options.concurrentProducer && !fusedGemm)
+        CUDA(cudaGraphLaunch(graphs[rank][kernelKind][blocks],
+                             ports[rank].stream));
     }
+    if (parallelLaunch) launchGpuBatch();
     if (!publishOnly && fusedGemm)
       emitGemm(ports, producerBlocks, consumerBlocks, capacity);
     else if (!publishOnly && options.backend == TransportBackend::Dma)
@@ -2110,8 +2470,8 @@ struct PacketPipeline::Impl {
             !binding->producerEvents[r].empty() && (plan.sources & (1U << r)))
           CUDA(cudaStreamWaitEvent(ports[r].stream,
                                    binding->producerEvents[r][stripe], 0));
-        dispatchTransport<<<producers[r] + consumers[r],
-                            options.transportThreads, 0, ports[r].stream>>>(
+        dispatchTransport<><<<producers[r] + consumers[r],
+                              options.transportThreads, 0, ports[r].stream>>>(
             mappedCommands[r], dispatches[r], begin, end, end == tiles);
         CUDA(cudaGetLastError());
       }
@@ -2411,8 +2771,7 @@ void PacketPipeline::prepareGemm(int m, int n, int k,
                         : work;
     size_t grain = impl_->options.transportGrainBytes;
     int crew = residentTransportCrew(impl_->maxBlocks[rank], work, elements,
-                                     layout,
-                                     impl_->options.packetBytes,
+                                     layout, impl_->options.packetBytes,
                                      impl_->options.fusedTransportCrew);
     int upload = std::min<size_t>(
         crew, std::max<size_t>(1, (work * 2 + grain - 1) / grain));

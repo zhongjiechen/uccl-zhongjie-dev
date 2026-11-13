@@ -1,6 +1,9 @@
 #include "uccl_lite/collective_dispatch.hpp"
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -8,10 +11,72 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <elf.h>
+#include <link.h>
 #include <sched.h>
 
 namespace uccl_lite {
 namespace {
+std::string const& routerBuildId() {
+  // The containing ELF includes the CUDA fatbin for both static and shared
+  // builds. Its in-memory build ID distinguishes compiler/architecture/flag
+  // changes without CUDA initialization or filesystem races after relinking.
+  static std::string const identity = [] {
+    struct Image {
+      uintptr_t address;
+      std::array<unsigned char, 64> bytes{};
+      size_t count = 0;
+    } image{reinterpret_cast<uintptr_t>(&routerBuildId)};
+    dl_iterate_phdr(
+        [](dl_phdr_info* info, size_t, void* context) {
+          auto& image = *static_cast<Image*>(context);
+          uintptr_t base = info->dlpi_addr;
+          bool contains = false;
+          for (int i = 0; i < info->dlpi_phnum; ++i) {
+            auto const& p = info->dlpi_phdr[i];
+            uintptr_t segment = base + p.p_vaddr;
+            contains |= p.p_type == PT_LOAD && image.address >= segment &&
+                        image.address - segment < p.p_memsz;
+          }
+          if (!contains) return 0;
+          for (int i = 0; i < info->dlpi_phnum; ++i) {
+            auto const& p = info->dlpi_phdr[i];
+            if (p.p_type != PT_NOTE) continue;
+            auto cursor =
+                reinterpret_cast<unsigned char const*>(base + p.p_vaddr);
+            auto end = cursor + p.p_filesz;
+            while (size_t(end - cursor) >= sizeof(ElfW(Nhdr))) {
+              auto const& note = *reinterpret_cast<ElfW(Nhdr) const*>(cursor);
+              cursor += sizeof(ElfW(Nhdr));
+              size_t nameBytes = (size_t(note.n_namesz) + 3) & ~size_t(3);
+              size_t descBytes = (size_t(note.n_descsz) + 3) & ~size_t(3);
+              if (nameBytes > size_t(end - cursor)) break;
+              auto name = cursor;
+              cursor += nameBytes;
+              if (descBytes > size_t(end - cursor)) break;
+              if (note.n_type == NT_GNU_BUILD_ID && note.n_namesz == 4 &&
+                  std::memcmp(name, "GNU", 4) == 0 &&
+                  note.n_descsz <= image.bytes.size()) {
+                image.count = note.n_descsz;
+                std::memcpy(image.bytes.data(), cursor, image.count);
+                return 1;
+              }
+              cursor += descBytes;
+            }
+          }
+          return 1;
+        },
+        &image);
+    std::string result;
+    char const* digits = "0123456789abcdef";
+    for (size_t i = 0; i < image.count; ++i) {
+      result += digits[image.bytes[i] >> 4];
+      result += digits[image.bytes[i] & 15];
+    }
+    return result;
+  }();
+  return identity;
+}
 void check(cudaError_t error) {
   if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -119,7 +184,18 @@ Workload CollectiveCall::workload() const {
   if (!count || !expansion ||
       count > std::numeric_limits<size_t>::max() / scalar / expansion)
     throw std::invalid_argument("empty or overflowing collective extent");
-  return {collective, dtype, count * scalar * expansion, inPlace};
+  uintptr_t addresses = 0;
+  bool complete = !ports.empty();
+  for (auto const& port : ports) {
+    addresses |= reinterpret_cast<uintptr_t>(port.input) |
+                 reinterpret_cast<uintptr_t>(port.output);
+    complete &= port.input && port.output;
+  }
+  unsigned alignment = !complete ? 0
+                       : !addresses
+                           ? 256
+                           : 1U << std::min(8, __builtin_ctzll(addresses));
+  return {collective, dtype, count * scalar * expansion, inPlace, alignment};
 }
 
 CollectiveDispatcher::CollectiveDispatcher(Topology topology,
@@ -138,9 +214,10 @@ CollectiveDispatcher::CollectiveDispatcher(Topology topology,
   if (options_.reduction != cpu_router::ReductionPlacement::Cpu &&
       options_.reduction != cpu_router::ReductionPlacement::Gpu)
     throw std::invalid_argument("invalid reduction placement");
-  if (options_.interleaveScatter &&
-      options_.reduction != cpu_router::ReductionPlacement::Gpu)
-    throw std::invalid_argument("interleaved scatter requires GPU reduction");
+  if (options_.interleaveScatter && options_.concurrentProducer &&
+      options_.reduction == cpu_router::ReductionPlacement::Cpu)
+    throw std::invalid_argument(
+        "interleaved scatter requires standalone SM transport");
   if (options_.gpuProgress &&
       options_.reduction != cpu_router::ReductionPlacement::Gpu)
     throw std::invalid_argument("GPU progress requires GPU reduction");
@@ -165,37 +242,75 @@ CollectiveDispatcher::CollectiveDispatcher(Topology topology,
       options_.smallAllReduceWorkersPerNode > options_.workersPerNode ||
       (options_.smallAllReduceTransportBlocks != 0 &&
        options_.smallAllReduceTransportBlocks < 2) ||
-      options_.smallAllReduceTransportBlocks >= 256)
+      options_.smallAllReduceTransportBlocks > cpu_router::kMaxTransportBlocks)
     throw std::invalid_argument("invalid small AllReduce worker/grid choice");
+  if (options_.smallReduceScatterWorkersPerNode < 0 ||
+      options_.smallReduceScatterWorkersPerNode > 63)
+    throw std::invalid_argument("invalid small ReduceScatter worker limit");
+  if (options_.gpuLaunchWorkersPerNode < 0 ||
+      options_.gpuLaunchWorkersPerNode > cpu_router::kMaxRanks)
+    throw std::invalid_argument("invalid GPU launch worker limit");
+  if (options_.smallReduceScatterGpuProgressMaxBytes &&
+      (options_.smallReduceScatterGpuProgressMaxBytes < 128 ||
+       options_.smallReduceScatterGpuProgressMaxBytes > (64UL << 10) ||
+       options_.smallReduceScatterGpuProgressMaxBytes % 16))
+    throw std::invalid_argument(
+        "invalid small ReduceScatter GPU progress limit");
   std::ostringstream key;
+  key << ";transport-revision=5";
+  auto const& buildId = routerBuildId();
+  key << ";router-build-id=" << (buildId.empty() ? "unavailable" : buildId);
+  if (buildId.empty() && policy_.mode == RouterMode::Auto)
+    policy_.measurements
+        .clear();  // Unknown software retains the caller backend.
   // maxTensorBytes is a validation bound, not packet geometry or an allocation
   // size.
   key << ";options=" << options_.packetBytes << ',' << options_.minPacketBytes
       << ";small-ar-packet-v1=" << options_.smallAllReducePacketBytes << ','
       << ";small-rs-packet-v1=" << options_.smallReduceScatterPacketBytes
-      << ";small-rs-gpu-progress-v1="
-      << options_.smallReduceScatterGpuProgress << ','
-      << options_.transportBlocks << ',' << options_.transportThreads << ','
-      << options_.transportGrainBytes << ',' << options_.workersPerNode << ','
-      << options_.scatterWorkersPerNode << ',' << options_.grainElements << ','
-      << options_.replayCpu << ',' << options_.inlineReplay << ','
+      << ";small-rs-gpu-progress-v1=" << options_.smallReduceScatterGpuProgress
+      << ',' << options_.transportBlocks << ',' << options_.transportThreads
+      << ',' << options_.transportGrainBytes << ',' << options_.workersPerNode
+      << ',' << options_.scatterWorkersPerNode << ',' << options_.grainElements
+      << ',' << options_.replayCpu << ',' << options_.inlineReplay << ','
       << options_.concurrentProducer;
   // Keep the legacy CPU identity stable, but never reuse its measurements for
   // a different placement. GPU mode needs its own exact local calibration.
   if (options_.reduction != cpu_router::ReductionPlacement::Cpu)
     key << ";reduction=gpu-v1";
-  if (options_.interleaveScatter) key << ";scatter=interleaved-v2";
+  if (options_.interleaveScatter)
+    key << (options_.reduction == cpu_router::ReductionPlacement::Gpu
+                ? ";scatter=interleaved-v2"
+                : ";scatter=cpu-interleaved-v1");
+  if (options_.smallReduceScatterWorkersPerNode)
+    key << ";small-rs-256k-1m-workers-v1="
+        << options_.smallReduceScatterWorkersPerNode;
+  if (options_.batchCpuJobs) key << ";rs-batch-cpu-jobs-v1";
+  if (options_.directScatterResults) key << ";rs-direct-results-v1";
+  if (options_.gpuLaunchWorkersPerNode)
+    key << ";gpu-launch-workers-per-node-v1="
+        << options_.gpuLaunchWorkersPerNode;
   if (options_.gpuProgress) key << ";progress=gpu-v1";
   if (options_.agPerSourceProgress) key << ";ag-progress=per-source-v1";
+  if (options_.singleNumaReduction) key << ";single-numa-reduction=v1";
+  if (options_.singleCtaBytes)
+    key << ";single-cta-bytes-v1=" << options_.singleCtaBytes;
+  if (options_.transportVectorBytes != 16)
+    key << ";transport-vector-bytes=" << options_.transportVectorBytes;
   if (options_.smallAllReduceWorkersPerNode)
     key << ";small-ar-128-256k-workers-v1="
         << options_.smallAllReduceWorkersPerNode << ','
         << options_.smallAllReduceTransportBlocks;
   if (options_.smallReduceScatterGpuProgress64K)
     key << ";small-rs-64k-progress-v1";
+  if (options_.smallReduceScatterGpuProgressMaxBytes)
+    key << ";small-rs-progress-max-bytes-v1="
+        << options_.smallReduceScatterGpuProgressMaxBytes;
   if (options_.largeAllGatherPacketBytes)
     key << ";large-ag-packet-v1=" << options_.largeAllGatherPacketBytes;
   for (int cpu : options_.workerCpus) key << ";worker=" << cpu;
+  for (int cpu : options_.gpuLaunchAllowedCpus)
+    key << ";gpu-launch-allowed-cpu=" << cpu;
   for (int node : options_.numaNodes) key << ";numa=" << node;
   topology_.identity += key.str();
   for (char const* knob : {"UCCL_LITE_ROUTER_PROFILE", "UCCL_LITE_TIMELINE",
@@ -301,8 +416,7 @@ int CollectiveDispatcher::workersPerNodeFor(CollectiveCall const& call) const {
              ? options_.smallAllReduceWorkersPerNode
              : options_.workersPerNode;
 }
-int CollectiveDispatcher::transportBlocksFor(
-    CollectiveCall const& call) const {
+int CollectiveDispatcher::transportBlocksFor(CollectiveCall const& call) const {
   return options_.smallAllReduceTransportBlocks &&
                  call.collective == Collective::AllReduce &&
                  call.workload().bytes >= (128UL << 10) &&
@@ -313,9 +427,13 @@ int CollectiveDispatcher::transportBlocksFor(
 bool CollectiveDispatcher::smallReduceScatterGpuProgressFor(
     CollectiveCall const& call) const {
   return options_.smallReduceScatterGpuProgress &&
+         !options_.interleaveScatter &&
          options_.reduction == cpu_router::ReductionPlacement::Cpu &&
          call.collective == Collective::ReduceScatter &&
          (call.workload().bytes == (128UL << 10) ||
+          (options_.smallReduceScatterGpuProgressMaxBytes &&
+           call.workload().bytes <=
+               options_.smallReduceScatterGpuProgressMaxBytes) ||
           (options_.smallReduceScatterGpuProgress64K &&
            call.workload().bytes == (64UL << 10)));
 }
@@ -359,6 +477,20 @@ BackendDecision CollectiveDispatcher::prepare(CollectiveCall const& call) {
       activeOptions.reduction = cpu_router::ReductionPlacement::Gpu;
       activeOptions.gpuProgress = true;
     }
+    if (activeOptions.gpuLaunchWorkersPerNode) {
+      std::vector<int> permitted;
+      for (auto const& group : topology_.permittedCpuIds)
+        permitted.insert(permitted.end(), group.second.begin(),
+                         group.second.end());
+      if (activeOptions.gpuLaunchAllowedCpus.empty())
+        activeOptions.gpuLaunchAllowedCpus = std::move(permitted);
+      else
+        for (int cpu : activeOptions.gpuLaunchAllowedCpus)
+          if (std::find(permitted.begin(), permitted.end(), cpu) ==
+              permitted.end())
+            throw std::invalid_argument(
+                "GPU launch CPU outside inspected allowance");
+    }
     auto router = std::make_unique<cpu_router::CpuRouter>(activeOptions);
     router->prepare(call.ports);
     router_ = std::move(router);
@@ -386,17 +518,9 @@ BackendDecision CollectiveDispatcher::enqueue(CollectiveCall const& call) {
   if (routerSmallReduceScatterGpuProgress_ !=
       smallReduceScatterGpuProgressFor(call))
     throw std::logic_error("prepare CPU-router for this reduction mode");
-  // Graph replay needs the core's explicit publication protocol. Do not
-  // silently capture only GPU work.
-  for (auto const& port : call.ports) {
-    check(cudaSetDevice(port.device));
-    cudaStreamCaptureStatus status;
-    check(cudaStreamIsCapturing(port.stream, &status));
-    if (status != cudaStreamCaptureStatusNone)
-      throw std::invalid_argument(
-          "adaptive router is eager-only; use PacketPipeline capture/replay "
-          "API for graphs");
-  }
+  // PacketPipeline checks every stream before publishing any CPU or GPU work.
+  // This dispatcher never begins core capture, so that check also rejects
+  // external capture here. Avoid a second CUDA pass over the same streams.
   router_->enqueue(program(call), call.ports);
   return selected;
 }

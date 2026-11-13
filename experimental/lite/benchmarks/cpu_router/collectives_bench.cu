@@ -16,6 +16,7 @@
 #include <vector>
 #include <cuda_bf16.h>
 #include <nccl.h>
+#include <sched.h>
 
 using namespace uccl_lite;
 extern char** environ;
@@ -50,14 +51,26 @@ struct Config {
   int gpus = 8, warmup = 3, iterations = 10, repeats = 3;
   size_t begin = 1024, end = 1 << 20;
   size_t packetBytes = 512UL << 10;
+  size_t minPacketBytes = 128UL << 10;
   size_t largeAllGatherPacketBytes = 0;
   size_t smallAllReducePacketBytes = 128UL << 10;
   size_t smallReduceScatterPacketBytes = 128UL << 10;
   int workersPerNode = 23, transportBlocks = 64;
+  int transportThreads = 256, scatterWorkersPerNode = 16;
+  int smallReduceScatterWorkersPerNode = 0;
+  bool batchCpuJobs = false, directScatterResults = false;
+  int gpuLaunchWorkersPerNode = 0;
+  int transportVectorBytes = 16;
+  int mainCpu = -1;
+  size_t transportGrainBytes = 16UL << 10, grainElements = 8192;
+  size_t singleCtaBytes = 0;
   bool smallReduceScatterGpuProgress = true;
+  size_t smallReduceScatterGpuProgressMaxBytes = 0;
   bool inPlace = false;
   bool gpuReduce = false;
   bool gpuProgress = false;
+  bool agPerSourceProgress = false;
+  bool singleNumaReduction = false;
   bool interleaveScatter = false;
   bool shmOnly = false;
   bool reverse = false;
@@ -211,6 +224,8 @@ int main(int argc, char** argv) {
         cfg.end = std::stoull(next());
       else if (arg == "--packet-bytes")
         cfg.packetBytes = std::stoull(next());
+      else if (arg == "--min-packet-bytes")
+        cfg.minPacketBytes = std::stoull(next());
       else if (arg == "--large-ag-packet-bytes")
         cfg.largeAllGatherPacketBytes = std::stoull(next());
       else if (arg == "--small-ar-packet-bytes")
@@ -221,8 +236,36 @@ int main(int argc, char** argv) {
         cfg.workersPerNode = std::stoi(next());
       else if (arg == "--transport-blocks")
         cfg.transportBlocks = std::stoi(next());
+      else if (arg == "--transport-threads")
+        cfg.transportThreads = std::stoi(next());
+      else if (arg == "--transport-vector-bytes")
+        cfg.transportVectorBytes = std::stoi(next());
+      else if (arg == "--main-cpu")
+        cfg.mainCpu = std::stoi(next());
+      else if (arg == "--transport-grain-bytes")
+        cfg.transportGrainBytes = std::stoull(next());
+      else if (arg == "--single-cta-bytes")
+        cfg.singleCtaBytes = std::stoull(next());
+      else if (arg == "--cpu-grain-elements")
+        cfg.grainElements = std::stoull(next());
+      else if (arg == "--scatter-workers-per-node")
+        cfg.scatterWorkersPerNode = std::stoi(next());
+      else if (arg == "--small-rs-workers-per-node")
+        cfg.smallReduceScatterWorkersPerNode = std::stoi(next());
+      else if (arg == "--batch-cpu-jobs")
+        cfg.batchCpuJobs = true;
+      else if (arg == "--direct-scatter-results")
+        cfg.directScatterResults = true;
+      else if (arg == "--gpu-launch-workers-per-node")
+        cfg.gpuLaunchWorkersPerNode = std::stoi(next());
+      else if (arg == "--cpu-interleave-scatter")
+        cfg.interleaveScatter = true;
       else if (arg == "--no-small-rs-gpu-progress")
         cfg.smallReduceScatterGpuProgress = false;
+      else if (arg == "--small-rs-gpu-progress-max-bytes")
+        cfg.smallReduceScatterGpuProgressMaxBytes = std::stoull(next());
+      else if (arg == "--single-numa-reduction")
+        cfg.singleNumaReduction = true;
       else if (arg == "--op")
         cfg.operation = next();
       else if (arg == "--fallback")
@@ -248,6 +291,10 @@ int main(int argc, char** argv) {
       else if (arg == "--gpu-progress") {
         cfg.gpuReduce = true;
         cfg.gpuProgress = true;
+      } else if (arg == "--ag-per-source") {
+        cfg.gpuReduce = true;
+        cfg.gpuProgress = true;
+        cfg.agPerSourceProgress = true;
       } else if (arg == "--interleave-scatter") {
         cfg.gpuReduce = true;
         cfg.interleaveScatter = true;
@@ -280,6 +327,8 @@ int main(int argc, char** argv) {
             "stripes)\n"
             "  --packet-bytes BYTES (upper bound; default 524288, minimum "
             "131072)\n"
+            "  --min-packet-bytes BYTES (lower geometry bound; default "
+            "131072)\n"
             "  --large-ag-packet-bytes BYTES (AllGather >=4 MiB; 0 disables)\n"
             "  --small-ar-packet-bytes BYTES (default 131072 through 4 MiB; "
             "0 disables)\n"
@@ -287,7 +336,26 @@ int main(int argc, char** argv) {
             "256 KiB to 4 MiB; 0 disables)\n"
             "  --workers-per-node N --transport-blocks N (CPU router "
             "tuning)\n"
+            "  --transport-threads N (32..1024, multiple of 32)\n"
+            "  --transport-vector-bytes 16|32 (native 256-bit on Blackwell)\n"
+            "  --main-cpu N (pin submission after topology/thread "
+            "initialization)\n"
+            "  --transport-grain-bytes N --cpu-grain-elements N\n"
+            "  --scatter-workers-per-node N (0 uses all workers)\n"
+            "  --small-rs-workers-per-node N (CPU RS 256 KiB--1 MiB; 0 "
+            "preserves the regular cap)\n"
+            "  --batch-cpu-jobs (publish RS jobs before waking workers)\n"
+            "  --direct-scatter-results (CPU merge directly into result)\n"
+            "  --gpu-launch-workers-per-node N (eager GPU submission lanes; "
+            "0 uses caller)\n"
+            "  --cpu-interleave-scatter (CPU reduction, destination stripes)\n"
+            "  --ag-per-source (GPU progress with per-source AG readiness)\n"
+            "  --single-numa-reduction (direct CPU result packets on one NUMA "
+            "node)\n"
+            "  --single-cta-bytes N (one upload/consume CTA through N bytes)\n"
             "  --no-small-rs-gpu-progress (disable 128-KiB RS GPU progress)\n"
+            "  --small-rs-gpu-progress-max-bytes N (GPU progress through N "
+            "bytes, up to 64 KiB)\n"
             "  --warmup N --iterations N --repeats N (at least 3)\n"
             "Auto keeps the selected fallback unless matching validated "
             "evidence shows a stable "
@@ -337,9 +405,19 @@ int main(int argc, char** argv) {
         cfg.begin % (cfg.devices.size() * 2) || cfg.warmup < 1 ||
         cfg.iterations < 1 || cfg.repeats < 3 ||
         cfg.packetBytes < (128UL << 10) || cfg.packetBytes > (32UL << 20) ||
-        cfg.packetBytes % 16 ||
+        cfg.packetBytes % 16 || cfg.minPacketBytes < 16 ||
+        cfg.minPacketBytes > cfg.packetBytes || cfg.minPacketBytes % 16 ||
         cfg.workersPerNode < 1 || cfg.workersPerNode > 63 ||
-        cfg.transportBlocks < 2 || cfg.transportBlocks >= 256 ||
+        cfg.transportBlocks < 2 ||
+        cfg.transportBlocks > cpu_router::kMaxTransportBlocks ||
+        cfg.transportThreads < 32 || cfg.transportThreads > 1024 ||
+        cfg.transportThreads % 32 || cfg.transportGrainBytes < 16 ||
+        (cfg.transportVectorBytes != 16 && cfg.transportVectorBytes != 32) ||
+        cfg.mainCpu < -1 || cfg.mainCpu >= CPU_SETSIZE || !cfg.grainElements ||
+        cfg.scatterWorkersPerNode < 0 || cfg.scatterWorkersPerNode > 63 ||
+        cfg.smallReduceScatterWorkersPerNode < 0 ||
+        cfg.smallReduceScatterWorkersPerNode > 63 ||
+        cfg.gpuLaunchWorkersPerNode < 0 || cfg.gpuLaunchWorkersPerNode > 32 ||
         (cfg.largeAllGatherPacketBytes &&
          (cfg.largeAllGatherPacketBytes < cfg.packetBytes ||
           cfg.largeAllGatherPacketBytes > (32UL << 20) ||
@@ -372,6 +450,16 @@ int main(int argc, char** argv) {
                       "slowest_rank_us\n";
     }
     auto topology = inspectTopology(cfg.devices);
+    if (cfg.mainCpu >= 0) {
+      bool permitted = false;
+      for (auto const& group : topology.permittedCpuIds)
+        permitted |= std::find(group.second.begin(), group.second.end(),
+                               cfg.mainCpu) != group.second.end();
+      if (!permitted)
+        throw std::invalid_argument(
+            "main CPU is not permitted on a selected GPU NUMA node");
+      topology.identity += ";benchmark-main-cpu=" + std::to_string(cfg.mainCpu);
+    }
     if (cfg.shmOnly) {
       int physicalLinks = int(std::count(topology.peerAccess.begin(),
                                          topology.peerAccess.end(), true));
@@ -449,17 +537,28 @@ int main(int argc, char** argv) {
       cpu_router::CpuRouterOptions options;
       options.maxTensorBytes = cfg.end;
       options.packetBytes = cfg.packetBytes;
+      options.minPacketBytes = cfg.minPacketBytes;
       options.largeAllGatherPacketBytes = cfg.largeAllGatherPacketBytes;
       options.workersPerNode = cfg.workersPerNode;
       options.transportBlocks = cfg.transportBlocks;
+      options.transportThreads = cfg.transportThreads;
+      options.transportVectorBytes = cfg.transportVectorBytes;
+      options.transportGrainBytes = cfg.transportGrainBytes;
+      options.singleCtaBytes = cfg.singleCtaBytes;
+      options.grainElements = cfg.grainElements;
+      options.scatterWorkersPerNode = cfg.scatterWorkersPerNode;
+      options.smallReduceScatterWorkersPerNode =
+          cfg.smallReduceScatterWorkersPerNode;
+      options.batchCpuJobs = cfg.batchCpuJobs;
+      options.directScatterResults = cfg.directScatterResults;
+      options.gpuLaunchWorkersPerNode = cfg.gpuLaunchWorkersPerNode;
       options.smallAllReducePacketBytes = cfg.smallAllReducePacketBytes;
-      options.smallReduceScatterPacketBytes =
-          cfg.smallReduceScatterPacketBytes;
-      options.smallReduceScatterGpuProgress =
-          cfg.smallReduceScatterGpuProgress;
+      options.smallReduceScatterPacketBytes = cfg.smallReduceScatterPacketBytes;
+      options.smallReduceScatterGpuProgress = cfg.smallReduceScatterGpuProgress;
+      options.smallReduceScatterGpuProgressMaxBytes =
+          cfg.smallReduceScatterGpuProgressMaxBytes;
       if (cfg.devices.size() == 8 && !cfg.gpuReduce &&
-          cfg.workersPerNode == 23 &&
-          cfg.transportBlocks == 64) {
+          cfg.workersPerNode == 23 && cfg.transportBlocks == 64) {
         options.smallAllReduceWorkersPerNode = 4;
         options.smallAllReduceTransportBlocks = 16;
       }
@@ -470,12 +569,17 @@ int main(int argc, char** argv) {
                                         : cpu_router::ReductionPlacement::Cpu;
       options.interleaveScatter = cfg.interleaveScatter;
       options.gpuProgress = cfg.gpuProgress;
-      char const* routerName = cfg.interleaveScatter ? "cpu-router-gpu-striped"
-                               : cfg.gpuReduce       ? "cpu-router-gpu-reduce"
-                                                     : "cpu-router";
+      options.agPerSourceProgress = cfg.agPerSourceProgress;
+      options.singleNumaReduction = cfg.singleNumaReduction;
+      char const* routerName =
+          cfg.interleaveScatter && !cfg.gpuReduce ? "cpu-router-cpu-striped"
+          : cfg.interleaveScatter                 ? "cpu-router-gpu-striped"
+          : cfg.gpuReduce                         ? "cpu-router-gpu-reduce"
+                                                  : "cpu-router";
       if (cfg.gpuProgress)
         routerName = cfg.interleaveScatter ? "gpu-progress-striped"
                                            : "gpu-progress-flat";
+      if (cfg.agPerSourceProgress) routerName = "gpu-progress-per-source";
       CollectiveDispatcher selected(topology, policy, fallback, options);
       BackendPolicy forced = policy, off = policy;
       forced.mode = RouterMode::Force;
@@ -486,6 +590,13 @@ int main(int argc, char** argv) {
                                                         fallback, options);
         baseline = std::make_unique<CollectiveDispatcher>(topology, off,
                                                           fallback, options);
+      }
+      if (cfg.mainCpu >= 0) {
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        CPU_SET(cfg.mainCpu, &mask);
+        if (sched_setaffinity(0, sizeof(mask), &mask))
+          throw std::runtime_error("cannot pin submission CPU");
       }
       std::vector<Collective> operations =
           cfg.operation == "all"
@@ -509,9 +620,12 @@ int main(int argc, char** argv) {
         for (size_t bytes : sizes) {
           auto call = buffers.call(op, bytes, cfg.inPlace);
           char const* activeRouterName =
-              !cfg.gpuReduce && cfg.smallReduceScatterGpuProgress &&
+              !cfg.gpuReduce && !cfg.interleaveScatter &&
+                      cfg.smallReduceScatterGpuProgress &&
                       op == Collective::ReduceScatter &&
                       (bytes == (128UL << 10) ||
+                       (cfg.smallReduceScatterGpuProgressMaxBytes &&
+                        bytes <= cfg.smallReduceScatterGpuProgressMaxBytes) ||
                        (options.smallReduceScatterGpuProgress64K &&
                         bytes == (64UL << 10)))
                   ? "gpu-progress-small-rs"
@@ -582,9 +696,8 @@ int main(int argc, char** argv) {
             std::printf("%s,%zu,%d,%s,%.3f,%.3f,%.3f,%.4f,%d\n",
                         collectiveName(op), bytes, cfg.inPlace,
                         decision.cpuRouter ? activeRouterName : "fallback",
-                        t.median,
-                        t.minimum, t.maximum, decision.measuredSpeedup,
-                        selected.routerInitialized());
+                        t.median, t.minimum, t.maximum,
+                        decision.measuredSpeedup, selected.routerInitialized());
           }
         }
     }

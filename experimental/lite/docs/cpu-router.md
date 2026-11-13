@@ -296,11 +296,203 @@ selection uses only the validated SM transport. The historical DMA medium-size
 graph issue remains outside that path. The current module is single-node and
 single-process; it is separate from the existing MPI two-node CPU-router program.
 
+## Transport and calibration options
+
+| Option | Default | Purpose |
+| --- | ---: | --- |
+| `transportVectorBytes` | 16 | Set 32 for native 256-bit accesses on SM100+ with CUDA 12.9+, with alignment/tail fallbacks. BF16 dtype is unchanged. |
+| `singleNumaReduction` | false | CPU reduction directly into the pinned result packet on one NUMA node; retain staging across multiple nodes. |
+| `singleCtaBytes` | 0 | Optional complete-tensor cutoff for one CTA to upload and consume packets serially. |
+| `transportThreads` | 256 | Warp multiples from 32 to 1024, subject to actual kernel residency. |
+| `transportBlocks` | 64 | Grid upper bound through 1024; CUDA occupancy caps the actual arithmetic/vector variant. |
+
+The benchmark exposes these fields along with packet minimum, transport/CPU
+grain, scatter workers, and per-source AG progress. Its `--main-cpu` option
+pins only the benchmark's submission thread after topology and initial thread
+setup. The library does not impose caller affinity.
+
+These controls require local calibration; their defaults remain unchanged.
+
+Dispatcher profiles now bind the containing ELF's in-memory build ID and the
+call's minimum input/output alignment (capped at 256 bytes), in addition to the
+existing exact workload and topology keys. This distinguishes native and
+fallback vector paths and invalidates evidence after compiler, architecture,
+flag, or code changes. Profile version 2 records alignment; version 1 remains
+readable as unknown alignment for offline comparisons. Regenerate local profiles
+after rebuilding the library/C++ callers. If no software build ID is available,
+automatic mode retains the existing callback without router initialization.
+
+## Eight-L4 ReduceScatter scheduling
+
+The November 13 experiment adds four explicit C++ options. They do not enable
+the router without matching local calibration. The standalone benchmark exposes
+the corresponding flags; the C wrapper and multiprocess NCCL drop-in retain
+their existing configuration interfaces.
+
+| C++ option | Default | Benchmark flag and scope |
+| --- | ---: | --- |
+| `smallReduceScatterWorkersPerNode` | 0 | `--small-rs-workers-per-node 4` caps active CPU lanes for complete RS inputs from 256 KiB through 1 MiB. The executor pool and larger-message limit are unchanged. |
+| `batchCpuJobs` | false | `--batch-cpu-jobs` publishes the RS callback batch before notifying sleeping lanes, without creating unused completion tickets. |
+| `directScatterResults` | false | `--direct-scatter-results` acquires result-reader credits before merging into the pinned result packet, removing the temporary-to-result copy. |
+| `interleaveScatter` with CPU reduction | false | `--cpu-interleave-scatter` uploads one stripe per destination and keeps CPU partial reduction and merge. CPU stripes support standalone SM transport; GPU interleaving keeps its existing interface. |
+
+CPU destination stripes retain the public tensor layout, the local retained
+contribution, and the original BF16 partial/merge/retained rounding order.
+Padding in a final stripe is neither reduced nor copied to the output. Both
+layouts track the actual readers of each partial and result bank before reuse.
+Resident GEMM and flat producer-event stripes are outside the CPU interleaving
+experiment. The dispatcher includes every new option in its profile identity;
+CPU-interleaved and GPU-interleaved measurements are separate.
+
+The recommended candidate for fresh calibration is
+`--small-rs-workers-per-node 4 --batch-cpu-jobs`. Destination interleaving and
+direct result writes remain experiments: neither consistently improves this
+candidate over 1 KiB--1 MiB, and direct result writes regress at larger sizes.
+All configurations and negative results are retained in the
+[measurement record](../benchmarks/data/rs_opt_8l4_20261113/provenance.json),
+[screening summary](../benchmarks/data/rs_opt_8l4_20261113/performance_summary.csv)
+and [independent confirmation](../benchmarks/data/rs_opt_8l4_20261113/confirmation_summary.csv).
+
+The test host has eight NVIDIA L4s, ranks 0--3 on NUMA node 0 and 4--7 on node 1,
+driver 580.178.04, CUDA 12.9, and NCCL 2.28.9. These are BF16 out-of-place,
+single-process eager measurements, with complete input bytes per rank. Each
+configuration uses ten warmups and five alternating paired repetitions of twenty
+calls, checking every output element on all ranks. Timing is the slowest-rank
+CUDA-event interval in the original harness, including host submission gaps.
+Each fixed configuration has its own NCCL control; no per-size best variant is
+selected. Confirmation reverses configuration order and reports the median of
+two sweep medians; run ranges are retained and are not confidence intervals.
+
+| Complete input/rank | Current default | Worker cap + batch | Latency reduction | Paired NCCL / candidate |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 KiB | 211.5 us | 182.0 us | 13.9% | 1.16x |
+| 512 KiB | 240.9 us | 216.8 us | 10.0% | 1.25x |
+| 1 MiB | 333.1 us | 316.2 us | 5.1% | 1.12x |
+
+The 2/4-MiB router latencies remain approximately unchanged. Each configuration
+has a separately paired NCCL control, so the ratio column is not computed from
+one shared NCCL curve. Earlier attempts during another process's GPU workload
+are retained under `contended/` and excluded from these summaries. Final runs
+checked for other GPU compute processes before and after each sweep.
+
+From the Lite root, after building with the matching CUDA, CUTLASS and NCCL:
+
+```bash
+NCCL_NET=Socket NCCL_NET_PLUGIN=none NCCL_IB_DISABLE=1 \
+LD_LIBRARY_PATH="$PWD/build/nccl-2.28.9/lib:/usr/local/cuda-12.9/lib64" \
+./build/uccl_lite_collectives --gpus 8 --fallback nccl --op reducescatter \
+  --begin 1024 --end 1048576 --warmup 10 --iterations 20 --repeats 5 \
+  --small-rs-workers-per-node 4 --batch-cpu-jobs --main-cpu 23 \
+  --calibrate build/new-rs-batch.profile --samples build/new-rs-batch.csv
+```
+
+Choose fresh output paths. Replace `--calibrate` with `--profile` to replay the
+matching profile in automatic mode. Software rebuilds invalidate archived
+profiles, and a profile calibrated against NCCL cannot select against the local
+fallback. Unknown configurations retain the callback without router allocation.
+These measurements do not establish SGLang or multiprocess drop-in speedups.
+
+Validation includes mixed eager operations on 4/8/3 GPUs, a one-NUMA subset,
+delayed ranks, masks, misalignment and tails, independent randomized numerical
+and guard checks, graph queue wrap and the existing C-API graph path. The
+[check manifest](../benchmarks/data/rs_opt_8l4_20261113/correctness.json) records
+commands and outcomes. Native CPU queue tests cover credit exhaustion, sleeping
+workers and concurrent producers. ThreadSanitizer could not start on this host
+because of an unexpected memory mapping; its failure logs are retained.
+
+### Follow-up: small messages and host submission
+
+Two further C++ options are available for fresh local calibration:
+
+| C++ option | Default | Benchmark flag |
+| --- | ---: | --- |
+| `smallReduceScatterGpuProgressMaxBytes` | 0 | `--small-rs-gpu-progress-max-bytes 65536` extends GPU reduction/progress to complete RS inputs through 64 KiB. Larger inputs keep the existing placement choices, including the default 128-KiB GPU case. The limit accepts 128 B--64 KiB, in multiples of 16 B. |
+| `gpuLaunchWorkersPerNode` | 0 | `--gpu-launch-workers-per-node 4` reserves up to four spare CPU launch lanes per NUMA group and submits its GPU graphs in parallel. Each lane spins for up to 2 ms after work before sleeping. |
+
+The small-message option avoids CPU routing callbacks and the NUMA partial/merge
+handshake. It uses the existing GPU FP32 reduction and BF16 result conversion;
+its rounding order differs from hierarchical CPU BF16 partials. It does not
+enable CPU destination interleaving. `--no-small-rs-gpu-progress` disables both
+the new limit and the existing exact-size GPU choices.
+
+Parallel submission applies to eager standalone SM transport. Capture/replay,
+DMA and resident/concurrent producers retain their existing launch path. Calls
+return after every launch API has returned, preserving ordering for subsequent
+caller-stream events and consumers. This option requires explicit streams,
+including `cudaStreamLegacy`; `nullptr` and `cudaStreamPerThread` are rejected.
+Launch CPUs exclude router workers and the replay CPU. The dispatcher preserves
+its inspected CPU allowance even if the submitting thread is pinned later;
+`gpuLaunchAllowedCpus` can restrict it further. Both options, and any explicit
+CPU allowance, have separate calibration identities. Defaults remain unchanged.
+
+The dispatcher also delegates eager capture validation to the pipeline instead
+of repeating the same per-device CUDA checks. The pipeline checks the correct
+current device for each stream before publishing any commands or CPU jobs.
+
+The [follow-up record](../benchmarks/data/rs_submit_8l4_20261113/provenance.json)
+uses the same eight L4s, BF16 out-of-place data, CUDA 12.9 and NCCL 2.28.9.
+The submitting CPU is 47 in every configuration, including the frozen previous
+binary. Each configuration has ten warmups and five alternating paired repeats
+of twenty checked calls. Two sweeps reverse configuration order. The table
+reports the median of those two sweep medians, with no best-variant selection
+per size. These are fresh measurements, separate from the CPU-23 table above.
+The original slowest-rank event scope, including host submission gaps, is
+unchanged. Calls have no deliberate idle interval.
+
+| Complete input/rank | Previous cap4 + batch | Small-message GPU progress | GPU progress + parallel submission | Paired NCCL / combined |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 99.3 us | 94.0 us | 84.2 us | 1.41x |
+| 32 KiB | 115.7 us | 97.3 us | 88.6 us | 1.44x |
+| 64 KiB | 137.5 us | 114.2 us | 104.7 us | 1.30x |
+| 128 KiB | 151.0 us | 145.9 us | 138.2 us | 1.16x |
+| 256 KiB | 175.6 us | 175.1 us | 165.9 us | 1.24x |
+| 512 KiB | 211.7 us | 211.2 us | 207.4 us | 1.27x |
+| 1 MiB | 307.7 us | 307.7 us | 306.2 us | 1.13x |
+
+The [full confirmation](../benchmarks/data/rs_submit_8l4_20261113/final_summary.csv)
+also retains serial-current and parallel-only controls, run ranges, and the
+2/4-MiB points; the [plot](../benchmarks/data/rs_submit_8l4_20261113/summary.svg)
+compares the table's configurations through 1 MiB. Each fixed configuration
+has its own paired NCCL control. No
+additional 1-MiB improvement is established. Instrumented traces reduce the
+1-KiB GPU-start skew from 46.5 us to 24.5 us for the combined configuration;
+these trace timings are diagnostic, separate from the uninstrumented table.
+
+Prefer the small-message GPU option when testing a general workload. Parallel
+submission is a CPU-budget and call-spacing tradeoff: eight L4s use eight
+additional submission threads. A diagnostic probe inserts 5 ms of host idle
+time before each fill/start interval; at 1 KiB, GPU progress alone takes
+121.9 us and adding parallel submission takes 146.9 us. At 64 KiB the respective
+times are 140.3 and 164.4 us. These are single probe sweeps in a separate binary,
+not points in the confirmation table. Short-spin launch workers, one launch
+lane per node, and an SMT-conflicting submitting CPU also lost. All negatives,
+probe source, and raw samples are retained. Calibrate with representative
+producer work and call spacing before selecting the threaded option.
+
+For example, use `--main-cpu 47` and add
+`--small-rs-gpu-progress-max-bytes 65536` to the checked cap4/batch calibration
+command above. For dense calls with spare
+CPUs, separately calibrate a new profile with
+`--gpu-launch-workers-per-node 4`. Choose new output paths for each variant;
+archived profiles require their exact recorded binary and configuration.
+
+The [validation manifest](../benchmarks/data/rs_submit_8l4_20261113/correctness.json)
+records 17 passing checks: policy/dispatcher/executor/BF16 checks, 4,392 queued
+mixed eager operations on 1/3/4/8 GPUs, 3,000 graph calls including the C wrapper,
+and independent CPU/GPU scalar and guard oracles. The new
+`uccl_lite_dispatcher_cuda_check` checks explicit and implicit capture on each
+rank, rejection before command publication, eager recovery, thread-relative
+stream rejection, and preparation across the 64-KiB placement boundary.
+Matching automatic replay selects every recorded winning key; an unmeasured
+1,536-byte call and a changed launch configuration retain NCCL without router
+initialization. No multiprocess drop-in or application speedup is established.
+
 ## Checks
 
 ```bash
 ./build/uccl_lite_router_policy_check
 ./build/uccl_lite_dispatcher_check
+./build/uccl_lite_dispatcher_cuda_check
 ./build/uccl_lite_cpu_bf16_check
 ./build/uccl_lite_router_core_check
 ./build/uccl_lite_primitives_check

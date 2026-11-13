@@ -1,2 +1,5 @@
 # Preserve raw benchmark stdout exactly as captured by NCCL and MPI.
 benchmarks/data/multinode_peer_20261110/** -whitespace
+# Preserve raw RS CSVs, archived patches, and generated SVGs byte-for-byte.
+benchmarks/data/rs_opt_8l4_20261113/** -text -whitespace
+benchmarks/data/rs_submit_8l4_20261113/** -text -whitespace
