@@ -7,7 +7,7 @@ requests, 256 input and 32 output tokens each; 32 running requests maximum.
 Three-run median whole-batch latency: **UCCL-Lite 14.72 s vs NCCL 15.84 s
 (7.1% lower)**. This workload includes queueing.
 
-![Whole-batch latency bar chart](../../experimental/lite/docs/assets/sglang-e2e-latency-8l4.svg)
+![Whole-batch latency bar chart](../../docs/assets/sglang-e2e-latency-8l4.svg)
 
 This is an experimental **single-node, eight-process, BF16** NCCL compatibility
 layer for AllGather, ReduceScatter(SUM), and AllReduce(SUM). It forwards other
@@ -58,12 +58,12 @@ RS alone was only 0.3%.
 
 The proxy maps NCCL communicators by unique ID and rank; NCCL still handles
 initialization and unsupported operations. Its original data path in
-`../../experimental/lite/src/collectives/multiprocess_collectives.cc` uses
+`../../src/collectives/multiprocess_collectives.cc` uses
 whole-tensor GPU/host copies and a CPU callback. It is the fallback when the
 packet mode below is disabled.
 
 The experimental packet path in
-`../../experimental/lite/src/collectives/multiprocess_packet_ag.cu` uses two
+`../../src/collectives/multiprocess_packet_ag.cu` uses two
 shared, mapped host packet slots and system-scope generation signals. Each
 process launches transport on its own GPU stream. AG uses separate GPU upload
 and download crews for outputs of at least 512 KiB. RS uses a GPU path for
@@ -196,11 +196,13 @@ the order of windows in an invocation.
 
 ## Build and checks
 
+Run these commands from the repository root:
+
 ```bash
-make -C integration/nccl_lite
-make -C integration/nccl_lite check
-make -C integration/nccl_lite check-torch
-make -C integration/nccl_lite check-shared-packet
+make -C experimental/lite/integration/nccl_lite
+make -C experimental/lite/integration/nccl_lite check
+make -C experimental/lite/integration/nccl_lite check-torch
+make -C experimental/lite/integration/nccl_lite check-shared-packet
 ```
 
 Set `CUDA_HOME` and `NCCL_HOME` to the CUDA and NCCL header installations if
@@ -213,7 +215,7 @@ part of the measured configuration.
 `check` runs an eight-process C++ AG/RS/AR correctness test. `check-torch` verifies
 that `LD_PRELOAD` intercepts PyTorch's NCCL ProcessGroup calls, including the
 `ncclCommInitRankConfig` path. Both require eight idle GPUs. Generated files
-stay under `integration/nccl_lite/build/`.
+stay under `experimental/lite/integration/nccl_lite/build/`.
 Run `check` and `check-torch` through `run_packet_8l4.sh` to exercise packet
 mode; the plain commands above exercise the compatibility layer's default
 path. For the reported size curve, run `bench_torch.py` through the wrapper
@@ -239,7 +241,7 @@ replacement.
 Set both variables before launching the server and its worker processes:
 
 ```bash
-export LD_PRELOAD="$PWD/integration/nccl_lite/build/libuccl_lite_nccl_compat.so"
+export LD_PRELOAD="$PWD/experimental/lite/integration/nccl_lite/build/libuccl_lite_nccl_compat.so"
 export SGLANG_NCCL_SO_PATH="$LD_PRELOAD"
 export UCCL_LITE_NCCL_ENABLE=1
 export UCCL_LITE_NCCL_MAX_BYTES=33554432

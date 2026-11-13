@@ -5,7 +5,7 @@ NCCL_HOME ?= /usr
 REAL_NCCL ?= libnccl.so.2
 TORCHRUN ?= torchrun
 BUILD := build
-LITE := ../../experimental/lite
+LITE := ../..
 
 .PHONY: all check check-torch check-shared-packet check-sum2 check-ag-gemm check-ready-rs bench-sum2 clean
 all: $(BUILD)/libuccl_lite_nccl_compat.so

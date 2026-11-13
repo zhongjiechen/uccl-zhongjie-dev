@@ -1,0 +1,6 @@
+build/
+build-*/
+core
+core.*
+!/e2e_workloads_20261112.csv
+!/perf_8l4_20261112.csv

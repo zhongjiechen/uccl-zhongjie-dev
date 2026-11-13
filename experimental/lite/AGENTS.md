@@ -1,13 +1,15 @@
 # UCCL Lite
 
 This directory contains standalone CUDA collectives, fusion kernels, benchmarks,
-and design notes for PCIe GPU systems. MSCCL++ supplies the peer-path runtime;
-the optional CPU-router module uses its own CUDA/NUMA packet pipeline. Keep
-changes scoped to this directory unless another UCCL component
-actually needs updating.
+application integrations, and design notes for PCIe GPU systems. MSCCL++
+supplies the peer-path runtime; the optional CPU-router module uses its own
+CUDA/NUMA packet pipeline. Keep changes scoped to this directory unless another
+UCCL component actually needs updating.
 
-- Keep application integrations, serving hooks, Torch extensions, checkpoints,
-  vendored dependency trees, and compiled artifacts out of this project.
+- Keep application integrations and serving hooks under `integration/`, separate
+  from the standalone kernels and CPU-router core. Keep Torch extensions,
+  checkpoints, vendored dependency trees, and compiled artifacts out of source
+  directories.
 - Preserve MSCCL++, CUDA, NCCL, and CUTLASS API names. Project-owned names use
   `uccl_lite` or `UCCL Lite`.
 - `src/collectives/` contains standalone collective algorithms and their harnesses.
