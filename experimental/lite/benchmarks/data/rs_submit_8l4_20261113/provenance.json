@@ -1,6 +1,11 @@
 {
   "date_utc": "2026-11-13T17:59:26.378680+00:00",
   "plot": "summary.svg",
+  "plot_configuration": "hybrid_parallel",
+  "plot_bytes_range": [
+    1024,
+    1048576
+  ],
   "hardware": {
     "gpu": "8 x NVIDIA L4 (SM89), no cross-NUMA peer access",
     "ranks_by_numa": [

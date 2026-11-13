@@ -452,8 +452,8 @@ unchanged. Calls have no deliberate idle interval.
 The [full confirmation](../benchmarks/data/rs_submit_8l4_20261113/final_summary.csv)
 also retains serial-current and parallel-only controls, run ranges, and the
 2/4-MiB points; the [plot](../benchmarks/data/rs_submit_8l4_20261113/summary.svg)
-compares the table's configurations through 1 MiB. Each fixed configuration
-has its own paired NCCL control. No
+shows the combined configuration and its paired NCCL control through 1 MiB.
+Each fixed configuration has its own paired NCCL control. No
 additional 1-MiB improvement is established. Instrumented traces reduce the
 1-KiB GPU-start skew from 46.5 us to 24.5 us for the combined configuration;
 these trace timings are diagnostic, separate from the uninstrumented table.

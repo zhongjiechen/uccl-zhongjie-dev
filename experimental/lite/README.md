@@ -137,14 +137,14 @@ and packet-size screening support this choice.
 
 ##### ReduceScatter on single 8xL4 GPU
 
-![Eight-L4 BF16 ReduceScatter: fixed small-message GPU-progress and parallel-submission configurations versus the previous CPU-router configuration and paired NCCL, 1 KiB–1 MiB](benchmarks/data/rs_submit_8l4_20261113/summary.svg)
+![Eight-L4 BF16 ReduceScatter: UCCL Lite versus NCCL latency, 1 KiB–1 MiB](benchmarks/data/rs_submit_8l4_20261113/summary.svg)
 
 This follow-up measures BF16 out-of-place ReduceScatter with CUDA 12.9 and
 NCCL 2.28.9; sizes are complete input bytes per rank. Each point is the median
 of two sweeps in reversed configuration order; each sweep uses ten warmups and
 five alternating NCCL/router repeats of twenty checked calls. Timing is the
 slowest-rank eager CUDA-event interval,
-including host submission gaps. The configurations are fixed across sizes;
+including host submission gaps. UCCL Lite uses a fixed configuration across sizes;
 the figure does not select the best variant at each size.
 
 Small-message GPU progress plus eight CPU submission lanes reduces 1/32/64-KiB
