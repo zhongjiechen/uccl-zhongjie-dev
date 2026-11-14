@@ -111,109 +111,39 @@ on the longer batch was only 0.3% in this sequential test.
 
 #### 8xL4 GPU
 
-This comparison uses GPUs 0–3 on NUMA node 0 and 4–7 on node 1.
-AllReduce is in place; AllGather and ReduceScatter are out of place. The
-AllReduce and AllGather figures show the BF16 scheduling follow-up with CUDA
-12.9 and NCCL 2.28.9. Sizes are complete input bytes per rank for AllReduce and
-complete output bytes per rank for AllGather. Each operation uses one fixed
-configuration across sizes and its own paired NCCL control.
-
-Each point is the median of two reversed-order sweeps. A sweep uses ten warmups
-per backend and five alternating repetitions of twenty checked calls. Timing
-is the slowest-rank eager CUDA-event interval, including host submission gaps.
-Parallel submission is opt-in, reserves eight extra CPU threads and spins for
-up to 2 ms; call spacing and affinity matter. New AllReduce/AllGather sparse-call
-performance is not measured. [Full 1-KiB–4-MiB results, controls and validation](benchmarks/data/ar_ag_transfer_8l4_20261113/README.md)
-retain slower variants and the small 2/4-MiB differences. These standalone
-results do not establish an application or multiprocess drop-in speedup.
+BF16; AllReduce in place, AllGather and ReduceScatter out of place. Updated
+measurements through 4 MiB; 8 MiB–1 GiB points retain historical measurements.
+[Data and settings](benchmarks/data/overview_8l4_20261114/README.md).
 
 ##### AllReduce on single 8xL4 GPU
 
-![Eight-L4 BF16 AllReduce: UCCL Lite versus NCCL latency, 1 KiB–1 MiB](benchmarks/data/ar_ag_transfer_8l4_20261113/allreduce.svg)
-
-UCCL Lite uses four CPU workers per NUMA node, 16 transport blocks, CPU callback
-batching and four GPU submission lanes per NUMA node. GPU progress is enabled
-through 8 KiB. At 1 KiB, latency falls from **98.8 to 84.5 us** (14.5%); at
-1 MiB, it falls from **473.1 to 464.9 us** (1.7%). The configuration is
-**1.58/1.29x** faster than its paired NCCL control at those two sizes.
+![8xL4 GPU AllReduce: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput, UCCL Lite versus NCCL](docs/assets/collectives-8l4-allreduce-overview.svg)
 
 ##### AllGather on single 8xL4 GPU
 
-![Eight-L4 BF16 AllGather: UCCL Lite versus NCCL latency, 1 KiB–1 MiB](benchmarks/data/ar_ag_transfer_8l4_20261113/allgather.svg)
-
-UCCL Lite uses per-source GPU progress through 1 MiB, CPU callback batching and
-four GPU submission lanes per NUMA node, with the regular worker/grid settings.
-At 1 KiB, latency falls from **106.5 to 74.2 us** (30.3%); at 1 MiB, it falls
-from **308.2 to 265.7 us** (13.8%). The configuration is **1.61/1.39x** faster
-than its paired NCCL control at those two sizes.
-
-The earlier [AllReduce](docs/assets/collectives-8l4-allreduce-v6.svg) and
-[AllGather](docs/assets/collectives-8l4-allgather-v6.svg) 1-KiB–1-GiB overviews
-retain historical throughput measurements and the fastest measured
-project-owned path at each size, chosen without looking at NCCL. Their
-[AllReduce](benchmarks/data/ar_compact_8l4_20261111/README.md) and
-[AllGather](benchmarks/data/ag_packet_8l4_20261111/README.md) packet/worker
-settings differ from this follow-up; sizes above 4 MiB were not remeasured.
-The ReduceScatter figure below remains its separately recorded follow-up.
+![8xL4 GPU AllGather: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput, UCCL Lite versus NCCL](docs/assets/collectives-8l4-allgather-overview.svg)
 
 ##### ReduceScatter on single 8xL4 GPU
 
-![Eight-L4 BF16 ReduceScatter: UCCL Lite versus NCCL latency, 1 KiB–1 MiB](benchmarks/data/rs_submit_8l4_20261113/summary.svg)
-
-This follow-up measures BF16 out-of-place ReduceScatter with CUDA 12.9 and
-NCCL 2.28.9; sizes are complete input bytes per rank. Each point is the median
-of two sweeps in reversed configuration order; each sweep uses ten warmups and
-five alternating NCCL/router repeats of twenty checked calls. Timing is the
-slowest-rank eager CUDA-event interval,
-including host submission gaps. UCCL Lite uses a fixed configuration across sizes;
-the figure does not select the best variant at each size.
-
-Small-message GPU progress plus eight CPU submission lanes reduces 1/32/64-KiB
-latency to **84.2/88.6/104.7 us**, versus **99.3/115.7/137.5 us** for the prior
-worker-cap/batch configuration. The combined configuration is **1.41/1.44/1.30x**
-faster than its paired NCCL control at those sizes. There is no material
-additional gain at 1 MiB. Parallel submission is opt-in, spins for up to 2 ms,
-and regresses with 5-ms call spacing; GPU progress alone avoids these extra
-submission threads. [Configuration, limitations, and validation](docs/cpu-router.md#follow-up-small-messages-and-host-submission)
-and [raw measurements](benchmarks/data/rs_submit_8l4_20261113/provenance.json)
-include the slower variants and call-spacing probes. These standalone results
-do not establish an SGLang or multiprocess drop-in speedup.
-
-The [earlier 1-KiB–1-GiB overview](docs/assets/collectives-8l4-reducescatter-v6.svg)
-retains the historical large-message throughput measurements; those points
-were not remeasured with this follow-up's options.
+![8xL4 GPU ReduceScatter: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput, UCCL Lite versus NCCL](docs/assets/collectives-8l4-reducescatter-overview.svg)
 
 #### 8xL4 SHM
 
-This testbed reuses the eight-GPU host but disables every GPU peer link in
-UCCL-Lite's benchmark topology. NCCL P2P is disabled and its GPU channels
-are verified to use SHM. The physical PCIe topology is unchanged. UCCL-Lite
-uses host-memory packets for AllReduce, AllGather, and ReduceScatter; the
-128–256 KiB AllReduce and 64 KiB ReduceScatter cases use size-specific router
-settings. AllGather uses the SM-kernel host-packet path. AllReduce is in
-place; the others are out of place.
-The SHM AllGather figure reuses the tuned UCCL-Lite host-packet timings from
-the 8xL4 GPU sweep. Its 128/256 KiB AllReduce points likewise reuse the
-compact router run. NCCL SHM curves come from the earlier SHM sweep, so
-these points compare separate runs. Other AllReduce and ReduceScatter points
-retain their paired SHM measurements. [SHM results and transport evidence](benchmarks/data/shm_8l4_20261111/README.md)
-include the source of every plotted curve.
+Same eight L4s, BF16, with P2P disabled and NCCL SHM verified. Paired updates
+through 4 MiB; 8 MiB–1 GiB points retain historical measurements.
+[SHM data and settings](benchmarks/data/shm_refresh_8l4_20261114/README.md).
 
 ##### AllReduce on single 8xL4 SHM
 
-![8xL4 SHM AllReduce: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput versus NCCL SHM](docs/assets/collectives-8l4-shm-allreduce.svg)
+![8xL4 SHM AllReduce: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput, UCCL Lite versus NCCL SHM](docs/assets/collectives-8l4-shm-allreduce-overview.svg)
 
 ##### AllGather on single 8xL4 SHM
 
-![8xL4 SHM AllGather: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput versus NCCL SHM](docs/assets/collectives-8l4-shm-allgather.svg)
+![8xL4 SHM AllGather: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput, UCCL Lite versus NCCL SHM](docs/assets/collectives-8l4-shm-allgather-overview.svg)
 
 ##### ReduceScatter on single 8xL4 SHM
 
-![8xL4 SHM ReduceScatter: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput versus NCCL SHM](docs/assets/collectives-8l4-shm-reducescatter.svg)
-
-At 1 GiB, UCCL-Lite takes **279.4 / 166.6 / 172.1 ms** for AR / AG / RS,
-versus **403.7 / 195.6 / 218.0 ms** with NCCL SHM. At 64 KiB,
-AllReduce differs by only about 1%, so that point is effectively tied.
+![8xL4 SHM ReduceScatter: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput, UCCL Lite versus NCCL SHM](docs/assets/collectives-8l4-shm-reducescatter-overview.svg)
 
 ### Multi-node collectives
 

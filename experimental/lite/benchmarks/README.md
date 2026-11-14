@@ -26,6 +26,8 @@ records give their own topology and measurement protocol.
 
 | File | Scope and method |
 | --- | --- |
+| [overview_8l4_20261114](data/overview_8l4_20261114/README.md) | Six GPU/SHM README figures: updated 1-KiB–4-MiB points and recorded 8-MiB–1-GiB throughput; every point identifies its source. |
+| [shm_refresh_8l4_20261114](data/shm_refresh_8l4_20261114/README.md) | Fresh eight-L4 BF16 AR/AG/RS versus NCCL SHM, fixed optimized configurations through 4 MiB, reversed-order sweeps, 15,600 checked timed calls and verified SHM channels. |
 | [rs_submit_8l4_20261113](data/rs_submit_8l4_20261113/provenance.json) | Eight-L4 BF16 ReduceScatter follow-up: small-message GPU progress, optional parallel host submission, fixed-configuration paired NCCL confirmation, launch-skew traces, dense/sparse call-spacing probes, negative results, and eager/graph/capture-guard checks. |
 | [ar_ag_transfer_8l4_20261113](data/ar_ag_transfer_8l4_20261113/README.md) | Eight-L4 BF16 transfer of RS scheduling optimizations to AllReduce and AllGather: CPU callback batching, size-limited GPU progress, per-source AG readiness, parallel submission, paired NCCL confirmation and eager/graph checks. |
 | [rs_opt_8l4_20261113](data/rs_opt_8l4_20261113/provenance.json) | Eight-L4 BF16 ReduceScatter CPU scheduling: fixed worker-cap, batch-publication, direct-result and CPU destination-stripe ablations, paired NCCL controls over 1 KiB--4 MiB, reversed-order confirmation, raw per-call samples, calibration replay and eager/graph/numerical checks. |
