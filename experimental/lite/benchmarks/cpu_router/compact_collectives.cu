@@ -138,12 +138,19 @@ struct Buffers {
     }
   }
   void validate(int op, size_t count, unsigned gen, bool host = false) {
+    // Enqueue every rank's independent checker before waiting for any rank.
+    // This preserves full per-call validation without serializing eight large
+    // checks on the host. All checking remains outside the collective timer.
     for (int r = 0; r < ranks; ++r) {
       check(cudaSetDevice(r));
       auto* out = static_cast<__nv_bfloat16*>(ports[r].output);
       check(cudaMemsetAsync(errors[r], 0, sizeof(unsigned), ports[r].stream));
       verify<<<64, 256, 0, ports[r].stream>>>(out, count, r, ranks, op, gen,
                                               errors[r]);
+    }
+    for (int r = 0; r < ranks; ++r) {
+      check(cudaSetDevice(r));
+      auto* out = static_cast<__nv_bfloat16*>(ports[r].output);
       unsigned bad;
       check(cudaMemcpyAsync(&bad, errors[r], sizeof(bad),
                             cudaMemcpyDeviceToHost, ports[r].stream));
@@ -343,7 +350,7 @@ int main(int argc, char** argv) {
     int ranks = 8, op = 0, warmup = 10, iters = 20, repeats = 3, blocks = 16,
         idle = 0;
     size_t begin = 1024, end = 1UL << 20;
-    bool host = false, checking = false, reverse = false;
+    bool host = false, checking = false, reverse = false, shmOnly = false;
     auto variants = split("nccl,router-tuned,mini");
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -378,27 +385,49 @@ int main(int argc, char** argv) {
         checking = true;
       else if (a == "--reverse")
         reverse = true;
+      else if (a == "--shm-only")
+        shmOnly = true;
       else
         throw std::invalid_argument("unknown option " + a);
     }
     if (ranks != 4 && ranks != 8)
       throw std::invalid_argument("use four or eight GPUs");
+    if (shmOnly) {
+      if (setenv("NCCL_P2P_DISABLE", "1", 1) ||
+          setenv("NCCL_SHM_DISABLE", "0", 1))
+        throw std::runtime_error("cannot configure NCCL SHM");
+      for (int r = 0; r < ranks; ++r) {
+        check(cudaSetDevice(r));
+        for (int peer = 0; peer < ranks; ++peer) {
+          if (peer == r) continue;
+          auto status = cudaDeviceDisablePeerAccess(peer);
+          if (status == cudaErrorPeerAccessNotEnabled)
+            cudaGetLastError();
+          else
+            check(status);
+        }
+      }
+    }
     if (checking) {
       correctness(ranks);
       return 0;
     }
     if (op < 0 || begin < 16 * size_t(ranks) || begin % (2 * ranks) ||
-        end < begin || end % (2 * ranks) || end > (16UL << 20) || warmup < 1 ||
+        end < begin || end % (2 * ranks) || end > (1UL << 30) || warmup < 1 ||
         iters < 1 || repeats < 1 || idle < 0)
       throw std::invalid_argument("invalid benchmark configuration");
     for (auto const& v : variants) {
       if (v != "nccl" && v != "nccl-graph" && v != "router-base" &&
           v != "router-progress" && v != "router-tuned" &&
           v != "router-single" && v != "router-full-ag" &&
-          v != "router-full-ag-compact" && v != "mini" && v != "resident")
+          v != "router-full-ag-compact" && v != "router-bulk" &&
+          v != "current" && v != "mini" && v != "resident")
         throw std::invalid_argument("unknown variant " + v);
       if (v == "mini" && op != 0)
         throw std::invalid_argument("mini supports AG only");
+      if ((v == "mini" || v == "resident") && end > (16UL << 20))
+        throw std::invalid_argument(
+            "standalone mini/resident extent exceeds tested capacity");
       if ((v == "router-full-ag" || v == "router-full-ag-compact") && op != 0)
         throw std::invalid_argument("full AG progress supports AG only");
       if ((v == "resident" || v == "nccl-graph") && !host)
@@ -410,6 +439,10 @@ int main(int argc, char** argv) {
     b.warmKernels();
     // Inspect the full CPU allowance before pinning the submission thread.
     auto topology = inspectTopology(b.ids);
+    if (shmOnly) {
+      std::fill(topology.peerAccess.begin(), topology.peerAccess.end(), false);
+      topology.identity += ";logical-no-p2p-shm-v1";
+    }
     cpu_set_t allowed;
     CPU_ZERO(&allowed);
     if (sched_getaffinity(0, sizeof(allowed), &allowed))
@@ -432,20 +465,42 @@ int main(int argc, char** argv) {
         ranks, op, version,
         host ? "host-global-completion" : "slowest-GPU-event", idle, blocks,
         warmup, iters, repeats);
+    std::printf("# testbed=%s; host-packet UCCL transport; NCCL P2P %s\n",
+                shmOnly ? "shm" : "gpu", shmOnly ? "disabled" : "default");
     std::puts("kind,bytes,variant,repeat,iteration,us");
     unsigned gen = 0;
+    std::vector<size_t> sizes;
     for (size_t bytes = begin; bytes <= end; bytes *= 2) {
+      sizes.push_back(bytes);
+      if (bytes > end / 2) break;
+    }
+    if (reverse) std::reverse(sizes.begin(), sizes.end());
+    for (size_t bytes : sizes) {
       size_t count = bytes / 2;
       auto call = callFor(b, op, count);
       for (int repeat = 0; repeat < repeats; ++repeat) {
         for (size_t j = 0; j < variants.size(); ++j) {
-          auto const& name = variants[(j + repeat) % variants.size()];
+          auto const& requested = variants[(j + repeat) % variants.size()];
+          std::string name = requested;
+          if (name == "current") {
+            if (op == 0 && bytes >= (256UL << 10) && bytes <= (1UL << 20))
+              name = "mini";
+            else if (op == 0 && bytes >= (2UL << 20))
+              name = "router-full-ag";
+            else if (op == 2 && bytes > (4UL << 20))
+              name = "router-bulk";
+            else
+              name = "router-tuned";
+          }
+          std::printf("# implementation,%zu,%s,%s\n", bytes, requested.c_str(),
+                      name.c_str());
           std::unique_ptr<Transport> compact;
           std::unique_ptr<CollectiveDispatcher> router;
           std::unique_ptr<NcclGraph> graph;
           std::function<void()> invoke;
           if (name == "mini" || name == "resident") {
-            compact = std::make_unique<Transport>(b.ports, end, blocks);
+            compact = std::make_unique<Transport>(
+                b.ports, std::min(end, 16UL << 20), blocks);
             if (name == "resident") {
               compact->start();
               invoke = [&]() { compact->run(op, count); };
@@ -472,13 +527,14 @@ int main(int argc, char** argv) {
               options.smallAllReduceGpuProgressMaxBytes = 8192;
               options.smallAllGatherGpuProgressMaxBytes = 1UL << 20;
               options.smallReduceScatterGpuProgressMaxBytes = 65536;
-              if (op == 2) {
+              if (op == 2 && name != "router-bulk") {
                 options.workersPerNode = 4;
                 options.transportBlocks = 16;
               }
             }
             if (name == "router-tuned" || name == "router-single" ||
-                name == "router-full-ag" || name == "router-full-ag-compact")
+                name == "router-full-ag" || name == "router-full-ag-compact" ||
+                name == "router-bulk")
               options.gpuLaunchWorkersPerNode = 4;
             if (name == "router-single") options.singleCtaBytes = 65536;
             if (name == "router-full-ag" || name == "router-full-ag-compact") {
@@ -539,20 +595,19 @@ int main(int argc, char** argv) {
             b.validate(op, count, gen);
             if (it >= 0) {
               times.push_back(us);
-              std::printf("sample,%zu,%s,%d,%d,%.6f\n", bytes, name.c_str(),
-                          repeat, it, us);
+              std::printf("sample,%zu,%s,%d,%d,%.6f\n", bytes,
+                          requested.c_str(), repeat, it, us);
             }
           }
           if (compact) compact->stop();
           std::sort(times.begin(), times.end());
           double median =
               (times[(times.size() - 1) / 2] + times[times.size() / 2]) / 2;
-          std::printf("median,%zu,%s,%d,-1,%.6f\n", bytes, name.c_str(), repeat,
-                      median);
+          std::printf("median,%zu,%s,%d,-1,%.6f\n", bytes, requested.c_str(),
+                      repeat, median);
           std::fflush(stdout);
         }
       }
-      if (bytes > end / 2) break;
     }
     for (auto comm : comms) ncclCheck(ncclCommDestroy(comm));
     return 0;

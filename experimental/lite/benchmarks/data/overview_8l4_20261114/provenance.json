@@ -7,6 +7,17 @@
     1048576,
     1073741824
   ],
+  "updated_ranges": {
+    "gpu": [
+      1024,
+      1073741824
+    ],
+    "shm": [
+      1024,
+      1073741824
+    ]
+  },
+  "historical_points": 0,
   "series": [
     "UCCL-Lite",
     "NCCL 2.28.9 or NCCL SHM"
@@ -17,102 +28,21 @@
     "docs/assets/collectives-8l4-reducescatter-overview.svg",
     "docs/assets/collectives-8l4-shm-allreduce-overview.svg",
     "docs/assets/collectives-8l4-shm-allgather-overview.svg",
-    "docs/assets/collectives-8l4-shm-reducescatter-overview.svg",
-    "docs/assets/collectives-8l4-resident-small.svg"
+    "docs/assets/collectives-8l4-shm-reducescatter-overview.svg"
   ],
   "source_sha256": {
-    "benchmarks/data/ag_packet_8l4_20261111/summary.csv": "e659de615519f92e7334759b70fd19dbd99bbbf839ca5952d5187361c6e63289",
-    "benchmarks/data/collectives_8l4_20261111.csv": "54cc431939d9b778d8ef81f832aaee6e031ae22a3b112a7af4439a2d6eb1fdb9",
-    "benchmarks/data/shm_8l4_20261111/figure_summary.csv": "047d2ac054b9082b8030aa21471171c26e73ba4179a7650b2d23cba6e2341fbf",
-    "benchmarks/data/shm_8l4_20261111/summary.csv": "0de05cf9c6c6ad2daf543a02d022ba6738ff353a308ae78da0a8fcf42debf55f",
-    "benchmarks/data/shm_refresh_8l4_20261114/summary.csv": "3e57e013abcc16b38593e72038021adc12890796a3487701acfde3f22c57bcb6",
-    "benchmarks/data/transfer_4to8_20261114/summary.csv": "06ad07144dc5aa3b11ac73ca5a27a9fc9dba053bcb5879c718e74a3d6ee579c9"
+    "benchmarks/data/full_refresh_8l4_20261114/summary.csv": "b871f1d376f802c086cf1571022f45932919aae2e4804180b61f0171a43a149a"
   },
   "figure_sha256": {
-    "docs/assets/collectives-8l4-allreduce-overview.svg": "77a1a3ec2d77a2ed75cc97e507c7c1122336741d4b7b26c7025ed5a881e16869",
-    "docs/assets/collectives-8l4-allgather-overview.svg": "53c6ec34a0252ab872a1f5bf35a9d826ae9a7b95371627f0522bfd688383537a",
-    "docs/assets/collectives-8l4-reducescatter-overview.svg": "bdd6c17e433e3cf38bfa073ad1b708caade531014a0b8fa89899ac790028d4a7",
-    "docs/assets/collectives-8l4-shm-allreduce-overview.svg": "939d2013bacf0af71e62ef9b35dc5ca60b819be816c1367a4523106c5d70bbf7",
-    "docs/assets/collectives-8l4-shm-allgather-overview.svg": "65c1010f557ced92ce371e41572e6f3a74a95d3d6f56fbbea3171d03d16eb1b5",
-    "docs/assets/collectives-8l4-shm-reducescatter-overview.svg": "3ccecb4a625df7b5a83bd0bb94a75fb10ff80255ef91179b07445f02b6c95ea4",
-    "docs/assets/collectives-8l4-resident-small.svg": "7a79fd58a623a4d8912b61eb69e729a4a6b281c0ac8a4d79b33971dd509bc2b9"
+    "docs/assets/collectives-8l4-allreduce-overview.svg": "f6dbbb9f8a43a8088fad63d4c56a8d8510fd4830ac0197d7bbb5f459d007a531",
+    "docs/assets/collectives-8l4-allgather-overview.svg": "becdc408f0a8b561a6a28f06b534b9bd00db6bc026dee2a4e07f436d69a0973c",
+    "docs/assets/collectives-8l4-reducescatter-overview.svg": "6e152facfb19dd586923e2bbb0861d4c844252af989c5f08548f7dbe041bbdc7",
+    "docs/assets/collectives-8l4-shm-allreduce-overview.svg": "b05bb7963d88c2ecbd73bcd1c477c7930474c575aa6a8390f24b27784cd70f86",
+    "docs/assets/collectives-8l4-shm-allgather-overview.svg": "87a45e93a91456e72a3d51b648880fdd00ee96e170670d67b1881264aa3de585",
+    "docs/assets/collectives-8l4-shm-reducescatter-overview.svg": "d3ff346da6c5614255569f9bfb5f144f7c51f8b0ac7e1e69ee35c1ea2da0fb11"
   },
   "per_size_best_variant": false,
-  "note": "GPU ordinary-call curves update 41 points from matched event-timed confirmations. AR/RS use one fixed tuned configuration; AG uses the documented region schedule, not per-point minimization. Historical tails and all SHM data/figures remain unchanged. Resident host-blocking measurements are shown only in a separate figure.",
-  "updated_ranges": {
-    "gpu": {
-      "all_reduce": [
-        1024,
-        4194304
-      ],
-      "all_gather": [
-        1024,
-        16777216
-      ],
-      "reduce_scatter": [
-        1024,
-        4194304
-      ]
-    },
-    "shm": {
-      "all": [
-        1024,
-        4194304
-      ]
-    }
-  },
-  "historical_ranges": {
-    "gpu": {
-      "all_reduce": [
-        8388608,
-        1073741824
-      ],
-      "all_gather": [
-        33554432,
-        1073741824
-      ],
-      "reduce_scatter": [
-        8388608,
-        1073741824
-      ]
-    },
-    "shm": {
-      "all": [
-        8388608,
-        1073741824
-      ]
-    }
-  },
-  "gpu_schedule": {
-    "all_reduce": "tuning_ar/router-tuned through 4 MiB",
-    "reduce_scatter": "tuning_rs/router-tuned through 4 MiB",
-    "all_gather": [
-      "tuning_ag/router-tuned through 128 KiB",
-      "ag_attribution/mini at 256 KiB through 1 MiB",
-      "ag_attribution/router-full-ag at 2 through 16 MiB"
-    ]
-  },
-  "resident_figure": {
-    "file": "docs/assets/collectives-8l4-resident-small.svg",
-    "source": "benchmarks/data/transfer_4to8_20261114/summary.csv",
-    "experiments": [
-      "confirm_tiny_ar",
-      "confirm_tiny_ag",
-      "confirm_tiny_rs"
-    ],
-    "variants": [
-      "resident",
-      "nccl-graph"
-    ],
-    "bytes": [
-      1024,
-      65536
-    ],
-    "timing": "input-ready host-global-completion",
-    "separate_from_overview": true
-  },
-  "plotting_environment": {
-    "updated_gpu_and_resident": "Python 3.10, Matplotlib 3.10.9; scripts/figure_style.py",
-    "shm": "unchanged SVGs from previous publication"
-  }
+  "plotting_environment": "Python 3.10, Matplotlib 3.10.9; scripts/figure_style.py",
+  "resident_figure": "Separate earlier transfer_4to8_20261114 experiment; unchanged in this full ordinary-call refresh",
+  "note": "All 126 points come from fresh matched two-sweep GPU/SHM measurements. Base-router comparisons and every regression are retained."
 }

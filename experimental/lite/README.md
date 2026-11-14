@@ -203,18 +203,20 @@ nominal losses at 32 KiB and 4 MiB; none are omitted from the table above.
 #### 8xL4 GPU
 
 BF16; AllReduce in place, AllGather and ReduceScatter out of place. Updated
-ordinary-call measurements through **4 MiB for AR/RS** and **16 MiB for AG**;
-larger points retain historical measurements. New points use input-ready,
-slowest-GPU CUDA events including submission gaps: ten warmups, five rotated
-repetitions of twenty checked calls, and two reversed sweeps.
+ordinary-call measurements now cover **every power of two from 1 KiB to 1 GiB**
+for all three operations. Every point is freshly measured, with no historical
+tail. Input-ready, slowest-GPU CUDA events include submission gaps: five
+warmups, three rotated repetitions of ten checked calls, and two reversed
+sweeps, with paired NCCL and base-router controls.
 [Data and settings](benchmarks/data/overview_8l4_20261114/README.md).
 
-AR/RS use the fixed tuned router configuration. AG uses that configuration
+AR uses compact CPU crews through 4 MiB and the regular crew/grid above it;
+RS retains its size-limited GPU progress and CPU worker caps. AG uses the tuned router
 through 128 KiB, the new mini-host kernel at 256 KiB–1 MiB, and the existing
-full GPU-progress router at 2–16 MiB. Each point retains its paired NCCL control.
+full GPU-progress router at 2 MiB–1 GiB. Each point retains its paired NCCL control.
 This measured size-range schedule is not an automatic dispatch policy. Parallel
 submission helps these dense calls but regresses after 5 ms of idle.
-[Transfer study, controls and regressions](benchmarks/data/transfer_4to8_20261114/README.md).
+[Full refresh, controls and regressions](benchmarks/data/full_refresh_8l4_20261114/README.md).
 
 ##### AllReduce on single 8xL4 GPU
 
@@ -243,9 +245,12 @@ concurrent model-compute performance is not established.
 
 #### 8xL4 SHM
 
-Same eight L4s, BF16, with P2P disabled and NCCL SHM verified. Paired updates
-through 4 MiB; 8 MiB–1 GiB points retain historical measurements.
-[SHM data and settings](benchmarks/data/shm_refresh_8l4_20261114/README.md).
+Same eight L4s, BF16, with P2P explicitly disabled and NCCL SHM verified.
+All **1 KiB–1 GiB** points are freshly and independently measured using the
+same UCCL schedule and paired protocol as GPU mode. The default GPU-mode NCCL
+initialization also selects SHM on this host; these are default-policy versus
+explicitly disabled-P2P testbeds, not a measured P2P-versus-SHM comparison.
+[Complete GPU/SHM measurements and transport evidence](benchmarks/data/full_refresh_8l4_20261114/README.md).
 
 ##### AllReduce on single 8xL4 SHM
 

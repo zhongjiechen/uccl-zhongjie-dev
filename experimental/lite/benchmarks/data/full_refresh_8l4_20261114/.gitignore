@@ -1,0 +1,4 @@
+# Preserve complete measurements and transport evidence.
+!*.log
+!*.csv
+!*.json

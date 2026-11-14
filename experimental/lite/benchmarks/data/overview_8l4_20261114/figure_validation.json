@@ -1,16 +1,8 @@
 {
-  "overview_rows": 126,
-  "gpu_updated_rows": 41,
-  "gpu_historical_rows": 22,
-  "shm_unchanged_rows": 63,
-  "shm_svg_hashes_unchanged": true,
-  "all_transfer_artifact_hashes_verified": true,
-  "paired_nccl_rows_verified": true,
-  "visual_inspection": [
-    "allreduce",
-    "allgather",
-    "reducescatter",
-    "resident"
-  ],
-  "new_gpu_benchmarks": false
+  "fresh_points": 126,
+  "historical_points": 0,
+  "all_paired_source_rows_verified": true,
+  "raw_samples_validated": 22680,
+  "warmups_checked": 11340,
+  "visual_inspection": "all six GPU/SHM figures; RS regressions visible"
 }
