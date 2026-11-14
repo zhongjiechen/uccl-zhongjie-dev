@@ -66,6 +66,8 @@ struct Config {
   size_t singleCtaBytes = 0;
   bool smallReduceScatterGpuProgress = true;
   size_t smallReduceScatterGpuProgressMaxBytes = 0;
+  size_t smallAllReduceGpuProgressMaxBytes = 0;
+  size_t smallAllGatherGpuProgressMaxBytes = 0;
   bool inPlace = false;
   bool gpuReduce = false;
   bool gpuProgress = false;
@@ -264,6 +266,10 @@ int main(int argc, char** argv) {
         cfg.smallReduceScatterGpuProgress = false;
       else if (arg == "--small-rs-gpu-progress-max-bytes")
         cfg.smallReduceScatterGpuProgressMaxBytes = std::stoull(next());
+      else if (arg == "--small-ar-gpu-progress-max-bytes")
+        cfg.smallAllReduceGpuProgressMaxBytes = std::stoull(next());
+      else if (arg == "--small-ag-gpu-progress-max-bytes")
+        cfg.smallAllGatherGpuProgressMaxBytes = std::stoull(next());
       else if (arg == "--single-numa-reduction")
         cfg.singleNumaReduction = true;
       else if (arg == "--op")
@@ -344,7 +350,7 @@ int main(int argc, char** argv) {
             "  --scatter-workers-per-node N (0 uses all workers)\n"
             "  --small-rs-workers-per-node N (CPU RS 256 KiB--1 MiB; 0 "
             "preserves the regular cap)\n"
-            "  --batch-cpu-jobs (publish RS jobs before waking workers)\n"
+            "  --batch-cpu-jobs (publish all CPU jobs before waking workers)\n"
             "  --direct-scatter-results (CPU merge directly into result)\n"
             "  --gpu-launch-workers-per-node N (eager GPU submission lanes; "
             "0 uses caller)\n"
@@ -356,6 +362,11 @@ int main(int argc, char** argv) {
             "  --no-small-rs-gpu-progress (disable 128-KiB RS GPU progress)\n"
             "  --small-rs-gpu-progress-max-bytes N (GPU progress through N "
             "bytes, up to 64 KiB)\n"
+            "  --small-ar-gpu-progress-max-bytes N (GPU progress through N "
+            "complete input bytes, up to 1 MiB)\n"
+            "  --small-ag-gpu-progress-max-bytes N (per-source GPU progress "
+            "through N "
+            "complete output bytes, up to 1 MiB)\n"
             "  --warmup N --iterations N --repeats N (at least 3)\n"
             "Auto keeps the selected fallback unless matching validated "
             "evidence shows a stable "
@@ -557,6 +568,10 @@ int main(int argc, char** argv) {
       options.smallReduceScatterGpuProgress = cfg.smallReduceScatterGpuProgress;
       options.smallReduceScatterGpuProgressMaxBytes =
           cfg.smallReduceScatterGpuProgressMaxBytes;
+      options.smallAllReduceGpuProgressMaxBytes =
+          cfg.smallAllReduceGpuProgressMaxBytes;
+      options.smallAllGatherGpuProgressMaxBytes =
+          cfg.smallAllGatherGpuProgressMaxBytes;
       if (cfg.devices.size() == 8 && !cfg.gpuReduce &&
           cfg.workersPerNode == 23 && cfg.transportBlocks == 64) {
         options.smallAllReduceWorkersPerNode = 4;
@@ -629,6 +644,14 @@ int main(int argc, char** argv) {
                        (options.smallReduceScatterGpuProgress64K &&
                         bytes == (64UL << 10)))
                   ? "gpu-progress-small-rs"
+              : !cfg.gpuReduce && op == Collective::AllReduce &&
+                      cfg.smallAllReduceGpuProgressMaxBytes &&
+                      bytes <= cfg.smallAllReduceGpuProgressMaxBytes
+                  ? "gpu-progress-small-ar"
+              : !cfg.gpuReduce && op == Collective::AllGather &&
+                      cfg.smallAllGatherGpuProgressMaxBytes &&
+                      bytes <= cfg.smallAllGatherGpuProgressMaxBytes
+                  ? "gpu-progress-small-ag"
                   : routerName;
           auto decision = selected.prepare(call);
           if (local && (!decision.cpuRouter || baseline)) local->prepare();

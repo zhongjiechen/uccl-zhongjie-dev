@@ -112,28 +112,49 @@ on the longer batch was only 0.3% in this sequential test.
 #### 8xL4 GPU
 
 This comparison uses GPUs 0–3 on NUMA node 0 and 4–7 on node 1.
-AllReduce is in place; AllGather and ReduceScatter are out of place. The earlier
-overview's UCCL Lite curves use the fastest measured project-owned path at that
-size, chosen without looking at NCCL. The CPU router is selected for all large
-AR/AG/RS sizes.
-At 128 and 256 KiB, AllReduce uses a compact CPU router with four workers
-per NUMA node and 16 transport blocks. [Paired measurements](benchmarks/data/ar_compact_8l4_20261111/README.md)
-replace the earlier 128 KiB local-path selection. At 128 KiB, ReduceScatter
-selects GPU reduction/progress; its RS curve uses the CPU-reduction router at
-other sizes. Its 256 KiB–4 MiB calls use 128 KiB packets. The separate
-ReduceScatter follow-up below compares fixed configurations on a later source
-revision, including optional GPU progress through 64 KiB.
-AllGather uses 512 KiB packets below 4 MiB and 2 MiB packets from 4 MiB
-through 1 GiB. The [paired AllGather measurements](benchmarks/data/ag_packet_8l4_20261111/README.md)
-and packet-size screening support this choice.
+AllReduce is in place; AllGather and ReduceScatter are out of place. The
+AllReduce and AllGather figures show the BF16 scheduling follow-up with CUDA
+12.9 and NCCL 2.28.9. Sizes are complete input bytes per rank for AllReduce and
+complete output bytes per rank for AllGather. Each operation uses one fixed
+configuration across sizes and its own paired NCCL control.
+
+Each point is the median of two reversed-order sweeps. A sweep uses ten warmups
+per backend and five alternating repetitions of twenty checked calls. Timing
+is the slowest-rank eager CUDA-event interval, including host submission gaps.
+Parallel submission is opt-in, reserves eight extra CPU threads and spins for
+up to 2 ms; call spacing and affinity matter. New AllReduce/AllGather sparse-call
+performance is not measured. [Full 1-KiB–4-MiB results, controls and validation](benchmarks/data/ar_ag_transfer_8l4_20261113/README.md)
+retain slower variants and the small 2/4-MiB differences. These standalone
+results do not establish an application or multiprocess drop-in speedup.
 
 ##### AllReduce on single 8xL4 GPU
 
-![8xL4 GPU AllReduce: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput versus NCCL](docs/assets/collectives-8l4-allreduce-v6.svg)
+![Eight-L4 BF16 AllReduce: UCCL Lite versus NCCL latency, 1 KiB–1 MiB](benchmarks/data/ar_ag_transfer_8l4_20261113/allreduce.svg)
+
+UCCL Lite uses four CPU workers per NUMA node, 16 transport blocks, CPU callback
+batching and four GPU submission lanes per NUMA node. GPU progress is enabled
+through 8 KiB. At 1 KiB, latency falls from **98.8 to 84.5 us** (14.5%); at
+1 MiB, it falls from **473.1 to 464.9 us** (1.7%). The configuration is
+**1.58/1.29x** faster than its paired NCCL control at those two sizes.
 
 ##### AllGather on single 8xL4 GPU
 
-![8xL4 GPU AllGather: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput versus NCCL](docs/assets/collectives-8l4-allgather-v6.svg)
+![Eight-L4 BF16 AllGather: UCCL Lite versus NCCL latency, 1 KiB–1 MiB](benchmarks/data/ar_ag_transfer_8l4_20261113/allgather.svg)
+
+UCCL Lite uses per-source GPU progress through 1 MiB, CPU callback batching and
+four GPU submission lanes per NUMA node, with the regular worker/grid settings.
+At 1 KiB, latency falls from **106.5 to 74.2 us** (30.3%); at 1 MiB, it falls
+from **308.2 to 265.7 us** (13.8%). The configuration is **1.61/1.39x** faster
+than its paired NCCL control at those two sizes.
+
+The earlier [AllReduce](docs/assets/collectives-8l4-allreduce-v6.svg) and
+[AllGather](docs/assets/collectives-8l4-allgather-v6.svg) 1-KiB–1-GiB overviews
+retain historical throughput measurements and the fastest measured
+project-owned path at each size, chosen without looking at NCCL. Their
+[AllReduce](benchmarks/data/ar_compact_8l4_20261111/README.md) and
+[AllGather](benchmarks/data/ag_packet_8l4_20261111/README.md) packet/worker
+settings differ from this follow-up; sizes above 4 MiB were not remeasured.
+The ReduceScatter figure below remains its separately recorded follow-up.
 
 ##### ReduceScatter on single 8xL4 GPU
 

@@ -3,3 +3,5 @@ benchmarks/data/multinode_peer_20261110/** -whitespace
 # Preserve raw RS CSVs, archived patches, and generated SVGs byte-for-byte.
 benchmarks/data/rs_opt_8l4_20261113/** -text -whitespace
 benchmarks/data/rs_submit_8l4_20261113/** -text -whitespace
+# Preserve raw AR/AG confirmation and its source patch byte-for-byte.
+benchmarks/data/ar_ag_transfer_8l4_20261113/** -text -whitespace

@@ -169,6 +169,13 @@ struct PacketPipelineOptions {
   // complete ReduceScatter inputs through this limit (128 B--64 KiB). Zero
   // keeps the existing exact-size choices. Requires separate calibration.
   size_t smallReduceScatterGpuProgressMaxBytes = 0;
+  // Adaptive dispatcher only: optional GPU progress through these complete
+  // tensor byte limits (16 B--1 MiB). AG uses per-source readiness and complete
+  // output bytes per rank.
+  // Zero preserves CPU progress. Each choice needs separate calibration;
+  // GPU AllReduce rereads every source and can lose beyond tiny messages.
+  size_t smallAllReduceGpuProgressMaxBytes = 0;
+  size_t smallAllGatherGpuProgressMaxBytes = 0;
   int transportBlocks = 64;
   // Fused GEMM only: cap each upload/download crew. Zero selects by shape.
   int fusedTransportCrew = 0;
@@ -215,8 +222,9 @@ struct PacketPipelineOptions {
   // Optional cap for CPU ReduceScatter with 256 KiB--1 MiB complete inputs.
   // Zero preserves scatterWorkersPerNode; requires its own calibration.
   int smallReduceScatterWorkersPerNode = 0;
-  // Explicit CPU scheduling/merge experiments, independent of GPU progress.
+  // Publish every active CPU lane before waking workers, for all layouts.
   bool batchCpuJobs = false;
+  // Explicit CPU merge experiment, independent of GPU progress.
   bool directScatterResults = false;
   // Optional eager SM graph-launch lanes per NUMA group. Zero submits on the
   // caller; positive values reserve spare NUMA-local CPUs at prepare. Requires

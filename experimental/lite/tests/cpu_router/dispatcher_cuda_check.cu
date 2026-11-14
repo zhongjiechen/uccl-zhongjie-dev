@@ -129,9 +129,102 @@ void run(bool legacy, int launchWorkers, bool smallGpu) {
     check(cudaFree(call.ports[rank].output));
   }
 }
+// Nonzero data across both placement boundaries, with aliasing and repeated
+// operation changes. A mode change must reject enqueue until prepare is called.
+void runArAgProgressBoundaries() {
+  std::vector<int> devices{0, 1, 4, 5};
+  constexpr size_t maxBytes = 65552;
+  constexpr uint16_t values[] = {0x3f80, 0x4000, 0x4040, 0x4080};
+  CollectiveCall call;
+  std::vector<void*> inputs, outputs;
+  for (int device : devices) {
+    check(cudaSetDevice(device));
+    void *input, *output;
+    cudaStream_t stream;
+    check(cudaMalloc(&input, maxBytes));
+    check(cudaMalloc(&output, maxBytes));
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    inputs.push_back(input);
+    outputs.push_back(output);
+    call.ports.push_back({input, output, stream, device});
+  }
+  BackendPolicy policy;
+  policy.mode = RouterMode::Force;
+  cpu_router::CpuRouterOptions options;
+  options.workersPerNode = 2;
+  options.maxTensorBytes = maxBytes;
+  options.batchCpuJobs = true;
+  options.gpuLaunchWorkersPerNode = 1;
+  options.smallAllReduceGpuProgressMaxBytes = 8192;
+  options.smallAllGatherGpuProgressMaxBytes = 65536;
+  // Equal packet geometry isolates progress-mode changes from packet changes.
+  options.smallAllReducePacketBytes = 0;
+  CollectiveDispatcher dispatcher(
+      inspectTopology(devices), policy,
+      [](CollectiveCall const&) {
+        throw std::runtime_error("unexpected AR/AG fallback");
+      },
+      options);
+  for (bool inPlace : {false, true})
+    for (Collective op : {Collective::AllReduce, Collective::AllGather}) {
+      size_t limit = op == Collective::AllReduce ? 8192 : 65536;
+      for (size_t bytes : {limit, limit + 16, size_t(1024)}) {
+        call.collective = op;
+        call.inPlace = inPlace;
+        call.count = bytes / 2 / (op == Collective::AllGather ? 4 : 1);
+        for (size_t rank = 0; rank < devices.size(); ++rank) {
+          auto& port = call.ports[rank];
+          check(cudaSetDevice(port.device));
+          port.output = outputs[rank];
+          port.input =
+              inPlace
+                  ? static_cast<uint16_t*>(outputs[rank]) +
+                        (op == Collective::AllGather ? rank * call.count : 0)
+                  : inputs[rank];
+          std::vector<uint16_t> data(call.count, values[rank]);
+          check(cudaMemcpy(const_cast<void*>(port.input), data.data(),
+                           data.size() * 2, cudaMemcpyHostToDevice));
+        }
+        if (bytes == limit + 16 ||
+            (op == Collective::AllGather && bytes == limit)) {
+          bool rejected = false;
+          try {
+            dispatcher.enqueue(call);
+          } catch (std::logic_error const&) {
+            rejected = true;
+          }
+          if (!rejected)
+            throw std::runtime_error("AR/AG mode change skipped prepare");
+        }
+        dispatcher.prepare(call);
+        dispatcher.enqueue(call);
+        for (auto const& port : call.ports) {
+          check(cudaSetDevice(port.device));
+          check(cudaStreamSynchronize(port.stream));
+          std::vector<uint16_t> result(bytes / 2);
+          check(cudaMemcpy(result.data(), port.output, bytes,
+                           cudaMemcpyDeviceToHost));
+          for (size_t i = 0; i < result.size(); ++i) {
+            uint16_t expected = op == Collective::AllGather
+                                    ? values[i / call.count]
+                                    : 0x4120;  // 1 + 2 + 3 + 4 = 10.
+            if (result[i] != expected)
+              throw std::runtime_error("incorrect AR/AG boundary result");
+          }
+        }
+      }
+    }
+  for (size_t rank = 0; rank < devices.size(); ++rank) {
+    check(cudaSetDevice(devices[rank]));
+    check(cudaStreamDestroy(call.ports[rank].stream));
+    check(cudaFree(inputs[rank]));
+    check(cudaFree(outputs[rank]));
+  }
+}
 }  // namespace
 int main() {
   try {
+    runArAgProgressBoundaries();
     for (int workers : {0, 1, 4}) {
       for (bool smallGpu : {false, true}) {
         run(false, workers, smallGpu);
@@ -140,7 +233,7 @@ int main() {
     }
     std::puts(
         "PASS: dispatcher rejects external/implicit capture on every rank; "
-        "eager recovery");
+        "eager recovery; AR/AG progress boundaries and in-place results");
     return 0;
   } catch (std::exception const& error) {
     std::fprintf(stderr, "%s\n", error.what());

@@ -2360,7 +2360,7 @@ struct PacketPipeline::Impl {
       ++published;
     }
     if (!options.gpuProgress) {
-      if (options.batchCpuJobs && plan.layout == PacketLayout::Scatter) {
+      if (options.batchCpuJobs) {
         size_t lanes[kMaxRanks * 63];
         size_t count = 0;
         for (int node = 0; node < nodes; ++node)

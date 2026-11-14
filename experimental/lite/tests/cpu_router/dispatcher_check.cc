@@ -178,7 +178,7 @@ int main() {
     require(
         !offset.prepare(offsetCall).cpuRouter && !offset.routerInitialized(),
         "different buffer alignment retains fallback without allocation");
-    for (int choice = 0; choice < 10; ++choice) {
+    for (int choice = 0; choice < 12; ++choice) {
       cpu_router::CpuRouterOptions tuned;
       if (choice == 0) tuned.transportVectorBytes = 32;
       if (choice == 1) tuned.singleCtaBytes = 65536;
@@ -193,6 +193,8 @@ int main() {
         tuned.gpuLaunchWorkersPerNode = 1;
         tuned.gpuLaunchAllowedCpus = {1, 3};
       }
+      if (choice == 10) tuned.smallAllReduceGpuProgressMaxBytes = 8192;
+      if (choice == 11) tuned.smallAllGatherGpuProgressMaxBytes = 65536;
       CollectiveDispatcher changed(t, calibrated, callback, tuned);
       require(!changed.prepare(call).cpuRouter && !changed.routerInitialized(),
               "new transport options cannot reuse another configuration's "
@@ -219,6 +221,24 @@ int main() {
           CollectiveDispatcher invalid(t, autoPolicy, callback, invalidWorkers);
         },
         "small RS progress threshold is validated before CUDA initialization");
+    for (size_t limit : {size_t(1), size_t(17), size_t(1048592)}) {
+      invalidWorkers = {};
+      invalidWorkers.smallAllReduceGpuProgressMaxBytes = limit;
+      rejects(
+          [&] {
+            CollectiveDispatcher invalid(t, autoPolicy, callback,
+                                         invalidWorkers);
+          },
+          "small AR progress limit is validated before CUDA initialization");
+      invalidWorkers = {};
+      invalidWorkers.smallAllGatherGpuProgressMaxBytes = limit;
+      rejects(
+          [&] {
+            CollectiveDispatcher invalid(t, autoPolicy, callback,
+                                         invalidWorkers);
+          },
+          "small AG progress limit is validated before CUDA initialization");
+    }
     std::cout << "Dispatcher: " << checks
               << " checks passed; no GPU initialization needed\n";
   } catch (std::exception const& e) {

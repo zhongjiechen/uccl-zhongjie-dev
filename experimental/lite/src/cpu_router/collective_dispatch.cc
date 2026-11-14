@@ -256,6 +256,10 @@ CollectiveDispatcher::CollectiveDispatcher(Topology topology,
        options_.smallReduceScatterGpuProgressMaxBytes % 16))
     throw std::invalid_argument(
         "invalid small ReduceScatter GPU progress limit");
+  for (size_t limit : {options_.smallAllReduceGpuProgressMaxBytes,
+                       options_.smallAllGatherGpuProgressMaxBytes})
+    if (limit && (limit < 16 || limit > (1UL << 20) || limit % 16))
+      throw std::invalid_argument("invalid small AR/AG GPU progress limit");
   std::ostringstream key;
   key << ";transport-revision=5";
   auto const& buildId = routerBuildId();
@@ -285,7 +289,7 @@ CollectiveDispatcher::CollectiveDispatcher(Topology topology,
   if (options_.smallReduceScatterWorkersPerNode)
     key << ";small-rs-256k-1m-workers-v1="
         << options_.smallReduceScatterWorkersPerNode;
-  if (options_.batchCpuJobs) key << ";rs-batch-cpu-jobs-v1";
+  if (options_.batchCpuJobs) key << ";batch-cpu-jobs-v2";
   if (options_.directScatterResults) key << ";rs-direct-results-v1";
   if (options_.gpuLaunchWorkersPerNode)
     key << ";gpu-launch-workers-per-node-v1="
@@ -306,6 +310,12 @@ CollectiveDispatcher::CollectiveDispatcher(Topology topology,
   if (options_.smallReduceScatterGpuProgressMaxBytes)
     key << ";small-rs-progress-max-bytes-v1="
         << options_.smallReduceScatterGpuProgressMaxBytes;
+  if (options_.smallAllReduceGpuProgressMaxBytes)
+    key << ";small-ar-progress-max-bytes-v1="
+        << options_.smallAllReduceGpuProgressMaxBytes;
+  if (options_.smallAllGatherGpuProgressMaxBytes)
+    key << ";small-ag-per-source-progress-max-bytes-v1="
+        << options_.smallAllGatherGpuProgressMaxBytes;
   if (options_.largeAllGatherPacketBytes)
     key << ";large-ag-packet-v1=" << options_.largeAllGatherPacketBytes;
   for (int cpu : options_.workerCpus) key << ";worker=" << cpu;
@@ -424,30 +434,44 @@ int CollectiveDispatcher::transportBlocksFor(CollectiveCall const& call) const {
              ? options_.smallAllReduceTransportBlocks
              : options_.transportBlocks;
 }
-bool CollectiveDispatcher::smallReduceScatterGpuProgressFor(
-    CollectiveCall const& call) const {
+CollectiveDispatcher::SmallGpuProgress
+CollectiveDispatcher::smallGpuProgressFor(CollectiveCall const& call) const {
+  if (options_.reduction != cpu_router::ReductionPlacement::Cpu)
+    return SmallGpuProgress::None;
+  size_t bytes = call.workload().bytes;
+  if (call.collective == Collective::AllReduce)
+    return options_.smallAllReduceGpuProgressMaxBytes &&
+                   bytes <= options_.smallAllReduceGpuProgressMaxBytes
+               ? SmallGpuProgress::Flat
+               : SmallGpuProgress::None;
+  if (call.collective == Collective::AllGather)
+    return options_.smallAllGatherGpuProgressMaxBytes &&
+                   bytes <= options_.smallAllGatherGpuProgressMaxBytes
+               ? SmallGpuProgress::PerSource
+               : SmallGpuProgress::None;
   return options_.smallReduceScatterGpuProgress &&
-         !options_.interleaveScatter &&
-         options_.reduction == cpu_router::ReductionPlacement::Cpu &&
-         call.collective == Collective::ReduceScatter &&
-         (call.workload().bytes == (128UL << 10) ||
-          (options_.smallReduceScatterGpuProgressMaxBytes &&
-           call.workload().bytes <=
-               options_.smallReduceScatterGpuProgressMaxBytes) ||
-          (options_.smallReduceScatterGpuProgress64K &&
-           call.workload().bytes == (64UL << 10)));
+                 !options_.interleaveScatter &&
+                 options_.reduction == cpu_router::ReductionPlacement::Cpu &&
+                 call.collective == Collective::ReduceScatter &&
+                 (call.workload().bytes == (128UL << 10) ||
+                  (options_.smallReduceScatterGpuProgressMaxBytes &&
+                   call.workload().bytes <=
+                       options_.smallReduceScatterGpuProgressMaxBytes) ||
+                  (options_.smallReduceScatterGpuProgress64K &&
+                   call.workload().bytes == (64UL << 10)))
+             ? SmallGpuProgress::Flat
+             : SmallGpuProgress::None;
 }
 BackendDecision CollectiveDispatcher::prepare(CollectiveCall const& call) {
   auto selected = decision(call);
   size_t packetBytes = packetBytesFor(call);
   int workersPerNode = workersPerNodeFor(call);
   int transportBlocks = transportBlocksFor(call);
-  bool smallGpu = smallReduceScatterGpuProgressFor(call);
-  if (selected.cpuRouter &&
-      (!router_ || routerPacketBytes_ != packetBytes ||
-       routerWorkersPerNode_ != workersPerNode ||
-       routerTransportBlocks_ != transportBlocks ||
-       routerSmallReduceScatterGpuProgress_ != smallGpu)) {
+  auto smallGpu = smallGpuProgressFor(call);
+  if (selected.cpuRouter && (!router_ || routerPacketBytes_ != packetBytes ||
+                             routerWorkersPerNode_ != workersPerNode ||
+                             routerTransportBlocks_ != transportBlocks ||
+                             routerSmallGpuProgress_ != smallGpu)) {
     for (auto const& port : call.ports) {
       check(cudaSetDevice(port.device));
       cudaStreamCaptureStatus status;
@@ -473,9 +497,11 @@ BackendDecision CollectiveDispatcher::prepare(CollectiveCall const& call) {
                 workersPerNode);
       activeOptions.workerCpus = std::move(selectedCpus);
     }
-    if (smallGpu) {
+    if (smallGpu != SmallGpuProgress::None) {
       activeOptions.reduction = cpu_router::ReductionPlacement::Gpu;
       activeOptions.gpuProgress = true;
+      activeOptions.agPerSourceProgress =
+          smallGpu == SmallGpuProgress::PerSource;
     }
     if (activeOptions.gpuLaunchWorkersPerNode) {
       std::vector<int> permitted;
@@ -497,7 +523,7 @@ BackendDecision CollectiveDispatcher::prepare(CollectiveCall const& call) {
     routerPacketBytes_ = packetBytes;
     routerWorkersPerNode_ = workersPerNode;
     routerTransportBlocks_ = transportBlocks;
-    routerSmallReduceScatterGpuProgress_ = smallGpu;
+    routerSmallGpuProgress_ = smallGpu;
   }
   return selected;
 }
@@ -515,8 +541,7 @@ BackendDecision CollectiveDispatcher::enqueue(CollectiveCall const& call) {
   if (routerWorkersPerNode_ != workersPerNodeFor(call) ||
       routerTransportBlocks_ != transportBlocksFor(call))
     throw std::logic_error("prepare CPU-router for this worker/grid choice");
-  if (routerSmallReduceScatterGpuProgress_ !=
-      smallReduceScatterGpuProgressFor(call))
+  if (routerSmallGpuProgress_ != smallGpuProgressFor(call))
     throw std::logic_error("prepare CPU-router for this reduction mode");
   // PacketPipeline checks every stream before publishing any CPU or GPU work.
   // This dispatcher never begins core capture, so that check also rejects

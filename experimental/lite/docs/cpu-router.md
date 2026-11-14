@@ -487,6 +487,43 @@ Matching automatic replay selects every recorded winning key; an unmeasured
 1,536-byte call and a changed launch configuration retain NCCL without router
 initialization. No multiprocess drop-in or application speedup is established.
 
+## AllReduce and AllGather scheduling
+
+The ReduceScatter follow-up's eager submission lanes also support AllReduce
+and AllGather. `batchCpuJobs` now publishes callbacks for every packet layout
+before waking CPU workers. Its calibration identity is versioned separately
+from the earlier RS-only implementation.
+
+Two additional C++ options limit GPU progress by complete tensor bytes:
+
+| C++ option | Default | Standalone benchmark flag |
+| --- | ---: | --- |
+| `smallAllReduceGpuProgressMaxBytes` | 0 | `--small-ar-gpu-progress-max-bytes N` |
+| `smallAllGatherGpuProgressMaxBytes` | 0 | `--small-ag-gpu-progress-max-bytes N` |
+
+Nonzero limits are multiples of 16 bytes, from 16 bytes through 1 MiB. AllReduce
+uses complete input bytes; AllGather uses complete output bytes per rank. Below
+the respective limit, GPU progress replaces CPU packet callbacks. AllGather
+also uses the existing per-source readiness path, so one source can be copied
+while another source is uploading. Above the limit, the configured CPU path
+remains available. Explicit global GPU mode retains its existing behavior.
+
+AllReduce GPU arithmetic reads every source on every destination GPU and rounds
+once in FP32, whereas the CPU path rounds intermediate NUMA partials to BF16.
+It can lose substantially beyond tiny messages. Do not copy ReduceScatter's
+64-KiB threshold into AllReduce without measurement.
+
+Both options are off by default and require fresh calibration for the exact
+operation, size, placement, topology and software. `prepare` is required when
+crossing a progress limit or changing between flat and per-source progress,
+even with identical packet geometry. Parallel submission retains its extra CPU
+reservation, 2-ms spin and sensitivity to call spacing; it is opt-in. The C
+wrapper and multiprocess NCCL drop-in expose no new controls in this change.
+
+The [eight-L4 transfer report](../benchmarks/data/ar_ag_transfer_8l4_20261113/README.md)
+records fixed-configuration paired measurements, slower candidates and
+correctness checks separately from the historical overview figures.
+
 ## Checks
 
 ```bash

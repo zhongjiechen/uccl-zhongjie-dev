@@ -44,7 +44,8 @@ class CollectiveDispatcher {
   size_t packetBytesFor(CollectiveCall const& call) const;
   int workersPerNodeFor(CollectiveCall const& call) const;
   int transportBlocksFor(CollectiveCall const& call) const;
-  bool smallReduceScatterGpuProgressFor(CollectiveCall const& call) const;
+  enum class SmallGpuProgress { None, Flat, PerSource };
+  SmallGpuProgress smallGpuProgressFor(CollectiveCall const& call) const;
   Topology topology_;
   BackendPolicy policy_;
   Fallback fallback_;
@@ -53,7 +54,7 @@ class CollectiveDispatcher {
   size_t routerPacketBytes_ = 0;
   int routerWorkersPerNode_ = 0;
   int routerTransportBlocks_ = 0;
-  bool routerSmallReduceScatterGpuProgress_ = false;
+  SmallGpuProgress routerSmallGpuProgress_ = SmallGpuProgress::None;
 };
 
 }  // namespace uccl_lite
