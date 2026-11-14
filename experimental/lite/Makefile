@@ -122,8 +122,14 @@ help:
 	@printf '%s\n' '  make peer-ring-check: signed-input asynchronous ring RS check' '  make peer-hybrid-allreduce peer-hybrid-check: experimental in-place ring/packet AR and independent check'
 
 	@printf '%s\n' '  make peer-small-medium-check: phased LL and host-gather checks' '  make resident-collectives resident-check: experimental prepared collectives and boundary checks'
+	@printf '%s\n' '  make compact-collectives: experimental BF16 mapped-host AG and resident AR/AG/RS, with router/NCCL controls'
 
 include src/cpu_router/module.mk
+
+.PHONY: compact-collectives
+compact-collectives: $(BUILD)/uccl_lite_compact_collectives
+$(BUILD)/uccl_lite_compact_collectives: benchmarks/cpu_router/compact_collectives.cu benchmarks/cpu_router/compact_transport.cuh $(ROUTER_STATIC) | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -std=c++17 $(ROUTER_INC) -I$(NCCL_HOME)/include $< $(ROUTER_STATIC) -o $@ -L$(NCCL_HOME)/lib -lnccl -Xlinker -rpath=$(NCCL_HOME)/lib -Xcompiler=-pthread -ldl
 
 -include $(wildcard $(BUILD)/*.d)
 

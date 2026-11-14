@@ -203,8 +203,18 @@ nominal losses at 32 KiB and 4 MiB; none are omitted from the table above.
 #### 8xL4 GPU
 
 BF16; AllReduce in place, AllGather and ReduceScatter out of place. Updated
-measurements through 4 MiB; 8 MiB–1 GiB points retain historical measurements.
+ordinary-call measurements through **4 MiB for AR/RS** and **16 MiB for AG**;
+larger points retain historical measurements. New points use input-ready,
+slowest-GPU CUDA events including submission gaps: ten warmups, five rotated
+repetitions of twenty checked calls, and two reversed sweeps.
 [Data and settings](benchmarks/data/overview_8l4_20261114/README.md).
+
+AR/RS use the fixed tuned router configuration. AG uses that configuration
+through 128 KiB, the new mini-host kernel at 256 KiB–1 MiB, and the existing
+full GPU-progress router at 2–16 MiB. Each point retains its paired NCCL control.
+This measured size-range schedule is not an automatic dispatch policy. Parallel
+submission helps these dense calls but regresses after 5 ms of idle.
+[Transfer study, controls and regressions](benchmarks/data/transfer_4to8_20261114/README.md).
 
 ##### AllReduce on single 8xL4 GPU
 
@@ -217,6 +227,19 @@ measurements through 4 MiB; 8 MiB–1 GiB points retain historical measurements.
 ##### ReduceScatter on single 8xL4 GPU
 
 ![8xL4 GPU ReduceScatter: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput, UCCL Lite versus NCCL](docs/assets/collectives-8l4-reducescatter-overview.svg)
+
+##### Prepared resident collectives on 8xL4 GPU
+
+![8xL4 prepared resident AR, AG and RS versus matched NCCL graph controls, 1–64 KiB](docs/assets/collectives-8l4-resident-small.svg)
+
+This separate **input-ready, host-blocking** experiment reserves one CTA per
+GPU and excludes preparation from both timings. NCCL uses one eight-device
+fork/join graph; resident workers stop during NCCL controls. At 1 KiB,
+resident AR / AG / RS take **17.46 / 21.69 / 14.90 µs**, versus graph NCCL
+**83.19 / 72.26 / 71.65 µs**. Resident AR loses at 64 KiB, as plotted.
+This is not the stream-enqueued API used in the ordinary-call figures above;
+concurrent model-compute performance is not established.
+[Matched tables and validation](benchmarks/data/transfer_4to8_20261114/results.md).
 
 #### 8xL4 SHM
 

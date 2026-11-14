@@ -8,6 +8,8 @@ benchmarks/data/ar_ag_transfer_8l4_20261113/** -text -whitespace
 # Preserve refreshed SHM samples and overview provenance byte-for-byte.
 benchmarks/data/shm_refresh_8l4_20261114/** -text -whitespace
 benchmarks/data/overview_8l4_20261114/** -text -whitespace
+# Preserve the transfer experiment's raw samples and recorded source patches.
+benchmarks/data/transfer_4to8_20261114/** -text -whitespace
 # Retain four-L4 measured evidence without newline or whitespace rewriting.
 benchmarks/data/analysis_4l4_20261113/** -text -whitespace
 benchmarks/data/optimization_4l4_20261113/** -text -whitespace

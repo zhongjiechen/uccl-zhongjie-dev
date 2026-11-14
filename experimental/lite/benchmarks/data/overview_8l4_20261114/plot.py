@@ -66,16 +66,23 @@ def make_figure(data, mode, operation, factor):
     fig.legend(handles[::-1], labels[::-1], loc="upper center",
                bbox_to_anchor=(0.5, 0.99), ncol=2, frameon=False,
                fontsize=12.5, handlelength=2.8, columnspacing=3.0, markerscale=1.2)
+    if mode == "gpu":
+        boundary = "16 MiB" if operation == "all_gather" else "4 MiB"
+        placement = "in place" if operation == "all_reduce" else "out of place"
+        fig.text(0.5, 0.025,
+                 f"BF16 · {placement} · CUDA-event timing · Nov 14 updates through {boundary}; larger sizes historical",
+                 ha="center", fontsize=8.5, color="#607486")
     return fig
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preview", action="store_true")
+    parser.add_argument("--testbed", choices=("gpu", "shm", "all"), default="all")
     args = parser.parse_args()
     configure()
     data = load()
-    for mode in ("gpu", "shm"):
+    for mode in (("gpu", "shm") if args.testbed == "all" else (args.testbed,)):
         for operation, name, factor in OPERATIONS:
             fig = make_figure(data, mode, operation, factor)
             prefix = "collectives-8l4-" + ("shm-" if mode == "shm" else "")
