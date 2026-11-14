@@ -93,21 +93,117 @@ on the longer batch was only 0.3% in this sequential test.
 
 ### Single-node collectives
 
+The latest four-L4 FP32 study covers **1 KiB–1 GiB for native AllReduce**,
+**16 B–1 GiB for AllGather/ReduceScatter**, and **16 B–1 MiB for all three in
+prepared resident mode**. Small, medium and large regions are shown separately.
+Sizes are full AR/RS input or AG output bytes per GPU.
+
+Ordinary AR uses four processes, in-place buffers and the maximum-rank host
+call timer (5 warmups, 3 alternating rounds × 10 calls). AG/RS use one process,
+out-of-place buffers and maximum-GPU eager CUDA events (20 warmups,
+3 rotated rounds × 10 calls). Each curve selects the lowest checked UCCL median
+per size; these are benchmark envelopes, not a portable runtime routing policy.
+NCCL 2.28.7 uses the same timing and placement as its paired candidate.
+[Methods, all candidates, correctness and negative results](benchmarks/data/small_medium_4l4_20261113/README.md).
+
+#### 1 KiB–1 MiB: every message size
+
+![Ordinary four-L4 AR, AG and RS latency at every power of two from 1 KiB through 1 MiB](docs/assets/collectives-4l4-1k-1m.svg)
+
+All 11 power-of-two sizes are shown. AR uses host timing; AG/RS use GPU events,
+so their timing scopes remain labeled separately. Complete numerical results
+and the full-range figures follow.
+
 #### AllReduce on single 4xL4 GPU
 
-![AllReduce latency and bus throughput, UCCL Lite versus NCCL](docs/assets/collectives-4l4-allreduce-refresh.svg)
+![AllReduce across small, medium and large messages](docs/assets/collectives-4l4-allreduce-all-sizes.svg)
+
+The native hierarchy now has explicit 1-/8-CTA candidates. At 1 MiB the
+8-CTA path takes **122.96 µs** versus paired NCCL **140.73 µs**. The benchmark's
+pageable-H2D input-readiness race was fixed before accepting these results.
+The separate large-message experimental hybrid still has its
+[own timing contract and measurements](benchmarks/data/optimization_4l4_20261113/EXPERIMENTS.md).
 
 #### AllGather on single 4xL4 GPU
 
-![Four-L4 FP32 AllGather: direct GPU path for small and medium sizes, per-source host-packet router for large sizes, versus NCCL](docs/assets/collectives-4l4-allgather-per-source.svg)
+![AllGather across small, medium and large messages](docs/assets/collectives-4l4-allgather-all-sizes.svg)
+
+The new fused `mini-host` candidate improves **1–16 MiB**. At 1 / 4 MiB it
+takes **66.43 / 188.79 µs**, versus prior UCCL candidates **72.82 / 241.38 µs**
+in the same sweep. The 4-MiB NCCL loss is closed. Larger sizes retain the
+per-source packet pipeline.
 
 #### ReduceScatter on single 4xL4 GPU
 
-![ReduceScatter latency and bus throughput, UCCL Lite versus NCCL](docs/assets/collectives-4l4-reducescatter-optimized.svg)
+![ReduceScatter across small, medium and large messages](docs/assets/collectives-4l4-reducescatter-all-sizes.svg)
 
-[Four-L4 AllReduce data](benchmarks/data/refresh_20261110/README.md) ·
-[Four-L4 ReduceScatter data](benchmarks/data/rs_ar_serial_4l4_20261111/README.md) ·
-[Four-L4 AllGather data](benchmarks/data/fp32_packet_ag_per_source_4l4_20261111/README.md)
+The phased LL hierarchy improves the small-message region: **32 KiB takes
+19.47 µs**, versus paired NCCL **30.43 µs**. The fused single-CTA path remains
+useful in the medium range, and the pipelined ring handles larger messages.
+
+#### Complete ordinary-call table
+
+Each cell is **UCCL / paired NCCL, in µs**; † marks a slower UCCL median.
+Do not compare AR and AG/RS timers directly. Run ranges are retained in the
+[AR](benchmarks/data/small_medium_4l4_20261113/ar_selected.csv),
+[AG](benchmarks/data/small_medium_4l4_20261113/ag_selected.csv) and
+[RS](benchmarks/data/small_medium_4l4_20261113/rs_selected.csv) CSVs; AG/RS also
+include the 16–512 B points. Small differences are not significance claims.
+
+| Full bytes/GPU | AllReduce | AllGather | ReduceScatter |
+| ---: | ---: | ---: | ---: |
+| 1 KiB | 13.81 / 20.22 | 14.28 / 27.24 | 14.86 / 27.71 |
+| 2 KiB | 14.38 / 19.65 | 14.39 / 27.59 | 15.16 / 27.60 |
+| 4 KiB | 14.13 / 20.49 | 14.28 / 27.71 | 15.16 / 27.58 |
+| 8 KiB | 15.72 / 21.07 | 14.53 / 28.10 | 16.75 / 28.36 |
+| 16 KiB | 21.26 / 22.61 | 14.72 / 29.75 | 19.08 / 29.32 |
+| 32 KiB | 24.20 / 23.61 † | 15.42 / 30.49 | 19.47 / 30.43 |
+| 64 KiB | 27.52 / 29.92 | 16.02 / 33.99 | 23.15 / 33.54 |
+| 128 KiB | 34.46 / 42.01 | 23.75 / 39.80 | 28.71 / 39.91 |
+| 256 KiB | 47.21 / 67.95 | 29.79 / 52.76 | 36.86 / 53.02 |
+| 512 KiB | 72.36 / 94.30 | 42.79 / 77.57 | 51.88 / 69.29 |
+| 1 MiB | 122.96 / 140.73 | 66.43 / 99.86 | 84.82 / 91.68 |
+| 2 MiB | 229.83 / 232.07 | 106.68 / 142.01 | 141.08 / 144.38 |
+| 4 MiB | 428.38 / 414.29 † | 188.79 / 233.67 | 228.54 / 242.47 |
+| 8 MiB | 743.33 / 774.34 | 351.89 / 414.38 | 388.56 / 441.72 |
+| 16 MiB | 1,432.76 / 1,555.88 | 677.11 / 778.43 | 729.42 / 841.96 |
+| 32 MiB | 2,735.49 / 3,310.81 | 1,283.04 / 1,522.86 | 1,423.72 / 1,547.16 |
+| 64 MiB | 5,261.33 / 5,806.67 | 2,414.68 / 3,003.25 | 2,559.09 / 3,045.14 |
+| 128 MiB | 10,313.91 / 11,488.01 | 4,691.23 / 5,971.41 | 5,030.72 / 5,995.80 |
+| 256 MiB | 20,438.83 / 22,882.68 | 9,246.39 / 11,885.43 | 9,964.19 / 11,856.81 |
+| 512 MiB | 40,694.23 / 45,496.36 | 18,351.97 / 23,686.68 | 19,841.98 / 23,457.39 |
+| 1 GiB | 80,299.75 / 90,727.92 | 36,502.68 / 47,856.71 | 39,608.75 / 47,395.80 |
+
+#### Prepared resident mode for small and medium messages
+
+![Prepared resident AR, AG and RS latency at every power of two from 1 KiB through 1 MiB](docs/assets/collectives-4l4-resident-1k-1m.svg)
+
+The [full resident figure](docs/assets/collectives-4l4-resident-small-medium.svg) also includes 16–512 B.
+
+This explicit experiment reserves one CTA per GPU and uses a packed command
+word instead of per-call kernel launches. It is **input-ready and host-blocking**,
+with preparation excluded; it is not a drop-in stream-enqueued API. AR is in
+place, AG/RS out of place. Both sides use one process, changed signed-random
+inputs, 20 warmups and 3 alternating rounds × 20 checked calls. Workers are
+stopped during NCCL controls. The resident curve uses one fixed protocol rule,
+not a per-size best-of envelope. Do not use device-wide synchronization while
+resident workers are active; concurrent model compute is not validated.
+
+Representative **resident / paired eager NCCL µs** (all 17 sizes are in the
+[complete CSV](benchmarks/data/small_medium_4l4_20261113/resident_selected.csv)):
+
+| Full bytes/GPU | Resident AR / NCCL | Resident AG / NCCL | Resident RS / NCCL |
+| ---: | ---: | ---: | ---: |
+| 16 B | 7.71 / 34.64 | 6.05 / 53.50 | 7.64 / 36.59 |
+| 1 KiB | 7.65 / 33.80 | 6.03 / 30.15 | 7.42 / 29.95 |
+| 16 KiB | 13.34 / 36.50 | 6.25 / 32.19 | 11.89 / 31.54 |
+| 64 KiB | 18.44 / 44.21 | 8.75 / 36.11 | 15.29 / 36.19 |
+| 256 KiB | 37.87 / 79.33 | 18.73 / 54.99 | 26.87 / 55.14 |
+| 1 MiB | 116.76 / 150.97 | 61.80 / 103.17 | 72.49 / 95.00 |
+
+Separate [paired NCCL graph controls](benchmarks/data/small_medium_4l4_20261113/resident_graph_selected.csv)
+and the graph limitations are documented in the study. Native AR retains
+nominal losses at 32 KiB and 4 MiB; none are omitted from the table above.
 
 #### 8xL4 GPU
 

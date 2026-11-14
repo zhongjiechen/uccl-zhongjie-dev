@@ -1,5 +1,14 @@
 # Single-node collectives
 
+The [November 13 full-range follow-up](../benchmarks/data/small_medium_4l4_20261113/README.md)
+is the latest four-L4 reference. It includes native AR from 1 KiB–1 GiB,
+AG/RS from 16 B–1 GiB, and separate prepared resident measurements. The native
+benchmark now completes input H2D copies on the collective stream before timing
+and changes input generation on every call; this fixes an input-readiness race
+found by the wider sweep. Explicit 1-/8-CTA hierarchy candidates improve the
+small/medium AR envelope. Historical configurations below remain separate.
+
+
 The MSCCL++ peer implementations below assume four GPUs in NUMA pairs
 `(0,1)` and `(2,3)`.
 `rank ^ 1` is the intra-socket peer and `rank ^ 2` the cross-socket peer.

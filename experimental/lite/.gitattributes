@@ -5,3 +5,9 @@ benchmarks/data/rs_opt_8l4_20261113/** -text -whitespace
 benchmarks/data/rs_submit_8l4_20261113/** -text -whitespace
 # Preserve raw AR/AG confirmation and its source patch byte-for-byte.
 benchmarks/data/ar_ag_transfer_8l4_20261113/** -text -whitespace
+# Retain four-L4 measured evidence without newline or whitespace rewriting.
+benchmarks/data/analysis_4l4_20261113/** -text -whitespace
+benchmarks/data/optimization_4l4_20261113/** -text -whitespace
+benchmarks/data/small_medium_4l4_20261113/** -text -whitespace
+# Matplotlib emits trailing spaces in generated SVG path data.
+docs/assets/collectives-4l4-*.svg -whitespace
