@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -786,16 +787,25 @@ enum Algo {
   A3_RING,
   A4_FLAT,
   A5_RSFLAT,
+  A1_SM1,
+  A1_SM8,
   NALGO
 };
 static char const* kAlgoName[NALGO] = {
-    "A0-null",    "A1-hier-sm", "A1-hier-ll",  "A1-hier-ce",
-    "A1-hier-cp", "A2-tree-sm", "A2-tree-ll",  "A2-tree-ce",
-    "A3-ring-ce", "A4-flat-ll", "A5-rsflat-ce"};
+    "A0-null",        "A1-hier-sm", "A1-hier-ll",   "A1-hier-ce",
+    "A1-hier-cp",     "A2-tree-sm", "A2-tree-ll",   "A2-tree-ce",
+    "A3-ring-ce",     "A4-flat-ll", "A5-rsflat-ce", "A1-hier-sm-1cta",
+    "A1-hier-sm-8cta"};
 
 struct Cfg {
   size_t minBytes = 16;
   size_t maxBytes = 256UL << 20;
+  bool fastSweep = false;
+  bool smVariants = false;
+  int smBlocks = 0;
+  size_t allocationBytes =
+      0;              // Optional fixed workspace for diagnostic sweeps.
+  int onlyAlgo = -1;  // Optional diagnostic filter; -1 measures all variants.
   int warmup = 10;
   int iters = 20;
   int blocks = 24;
@@ -826,7 +836,8 @@ static void runRank(int rank, mscclpp::UniqueId id, Cfg const& cfg) {
   bootstrap->initialize(id);
   mscclpp::Communicator comm(bootstrap);
 
-  const size_t N = cfg.maxBytes;  // data region size
+  const size_t N =
+      std::max(cfg.maxBytes, cfg.allocationBytes);  // data region size
   // LL16 doubles the payload, and A4 uses the packet regions too, so they must
   // be sized for whichever cutoff is larger -- otherwise pkt1 overruns into
   // pkt2.
@@ -979,8 +990,13 @@ static void runRank(int rank, mscclpp::UniqueId id, Cfg const& cfg) {
     };
     switch (a) {
       case A1_SM:
-        arHierPut<<<cfg.blocks, cfg.threads, 0, stream>>>(hIntra, hCross, rank,
-                                                          nelem, L);
+        arHierPut<<<cfg.smBlocks ? cfg.smBlocks : cfg.blocks, cfg.threads, 0,
+                    stream>>>(hIntra, hCross, rank, nelem, L);
+        break;
+      case A1_SM1:
+      case A1_SM8:
+        arHierPut<<<a == A1_SM1 ? 1 : 8, cfg.threads, 0, stream>>>(
+            hIntra, hCross, rank, nelem, L);
         break;
       case A1_LL:
         arHierLL<<<cfg.llBlocks, cfg.llThreads, 0, stream>>>(
@@ -1007,8 +1023,8 @@ static void runRank(int rank, mscclpp::UniqueId id, Cfg const& cfg) {
               chunksFor(nelem * sizeof(float) / 2), true, cfg.fence);
         break;
       case A2_SM:
-        arTreePut<<<cfg.blocks, cfg.threads, 0, stream>>>(hIntra, hCross, rank,
-                                                          nelem, L);
+        arTreePut<<<cfg.smBlocks ? cfg.smBlocks : cfg.blocks, cfg.threads, 0,
+                    stream>>>(hIntra, hCross, rank, nelem, L);
         break;
       case A2_LL:
         arTreeLL<<<cfg.llBlocks, cfg.llThreads, 0, stream>>>(
@@ -1048,24 +1064,29 @@ static void runRank(int rank, mscclpp::UniqueId id, Cfg const& cfg) {
     }
   };
 
-  // Deterministic, position-sensitive fill: rank r contributes
-  // (r+1)*(1+(j%97)). Ranks sum to 10, so the expected result is 10*(1+(j%97)).
-  auto fill = [&](size_t nelem) {
+  // Change generation every call so stale partials cannot pass validation.
+  auto fill = [&](size_t nelem, unsigned generation) {
     hostIn.resize(nelem);
     for (size_t j = 0; j < nelem; j++)
-      hostIn[j] = (float)(rank + 1) * (float)(1 + (j % 97));
-    CUDACHECK(cudaMemcpy(buf, hostIn.data(), nelem * sizeof(float),
-                         cudaMemcpyHostToDevice));
+      hostIn[j] = float(rank + 1 + 4 * generation) * float(1 + (j % 97));
+    // Pageable H2D cudaMemcpy may return before DMA completion. Order the
+    // copy on the collective stream and establish the input-ready boundary
+    // explicitly before the bootstrap barrier and timed call.
+    CUDACHECK(cudaMemcpyAsync(buf, hostIn.data(), nelem * sizeof(float),
+                              cudaMemcpyHostToDevice, stream));
+    CUDACHECK(cudaStreamSynchronize(stream));
   };
-  auto verify = [&](size_t nelem) -> double {
+  auto verify = [&](size_t nelem, unsigned generation) -> double {
     hostOut.resize(nelem);
     CUDACHECK(cudaMemcpy(hostOut.data(), buf, nelem * sizeof(float),
                          cudaMemcpyDeviceToHost));
     double worst = 0.0;
     long long firstBad = -1, nbad = 0;
     for (size_t j = 0; j < nelem; j++) {
-      double want = 10.0 * (double)(1 + (j % 97));
-      double err = std::fabs((double)hostOut[j] - want) / want;
+      double want = (10.0 + 16.0 * generation) * double(1 + (j % 97));
+      double err = std::isfinite(hostOut[j])
+                       ? std::fabs(double(hostOut[j]) - want) / want
+                       : std::numeric_limits<double>::infinity();
       if (err > 1e-5) {
         if (firstBad < 0) firstBad = (long long)j;
         nbad++;
@@ -1079,7 +1100,8 @@ static void runRank(int rank, mscclpp::UniqueId id, Cfg const& cfg) {
           "[rank %d] bad=%lld/%zu first j=%zu half=%d got=%.1f want=%.1f "
           "lastbadrun_end=%zu\n",
           rank, nbad, nelem, j, (int)(j >= nelem / 2), (double)hostOut[j],
-          10.0 * (double)(1 + (j % 97)), (size_t)(firstBad + nbad));
+          (10.0 + 16.0 * generation) * double(1 + (j % 97)),
+          (size_t)(firstBad + nbad));
     }
     return worst;
   };
@@ -1091,15 +1113,25 @@ static void runRank(int rank, mscclpp::UniqueId id, Cfg const& cfg) {
         "cutoff %zu B   CE chunk %zu B\n",
         cfg.blocks, cfg.threads, cfg.llBlocks, cfg.llThreads, cfg.llMaxBytes,
         cfg.chunkBytes);
+    std::printf(
+        "# input-ready: explicit collective-stream H2D completion; "
+        "changed generations; SM variants=%d fast-sweep=%d\n",
+        int(cfg.smVariants), int(cfg.fastSweep));
     std::printf("#\n# %12s %12s %14s %10s %10s %10s %10s\n", "size(B)", "count",
                 "algo", "time(us)", "algbw", "busbw", "maxrelerr");
   }
 
+  unsigned inputGeneration = 0;
   for (size_t bytes = cfg.minBytes; bytes <= cfg.maxBytes; bytes *= 2) {
     const size_t nelem = bytes / sizeof(float);
     if (nelem < 4) continue;  // A1 needs >= 1 packet unit per half
 
     for (int a = 0; a < NALGO; a++) {
+      if (cfg.onlyAlgo >= 0 && a != cfg.onlyAlgo) continue;
+      if ((a == A1_SM1 || a == A1_SM8) &&
+          ((!cfg.smVariants && cfg.onlyAlgo != a) || bytes > (4UL << 20)))
+        continue;
+      if (cfg.fastSweep && bytes > (4UL << 20) && a != A3_RING) continue;
       bool const isLL = (a == A1_LL || a == A2_LL || a == A4_FLAT);
       if (isLL && bytes > cfg.flatMaxBytes && a == A4_FLAT) continue;
       if ((a == A1_LL || a == A2_LL) && bytes > cfg.llMaxBytes) continue;
@@ -1114,15 +1146,16 @@ static void runRank(int rank, mscclpp::UniqueId id, Cfg const& cfg) {
       double worstErr = -1.0;
       double timedSum = 0.0;
       for (int i = 0; i < cfg.warmup + cfg.iters; ++i) {
-        fill(nelem);
+        unsigned generation = (++inputGeneration) % 101;
+        fill(nelem, generation);
         bootstrap->barrier();
         auto t0 = std::chrono::steady_clock::now();
         launch((Algo)a, nelem, i);
         CUDACHECK(cudaStreamSynchronize(stream));
         auto t1 = std::chrono::steady_clock::now();
-        double us =
-            std::chrono::duration<double, std::micro>(t1 - t0).count();
-        double relerr = cfg.check && a != A0_NULL ? verify(nelem) : -1.0;
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        double relerr =
+            cfg.check && a != A0_NULL ? verify(nelem, generation) : -1.0;
         std::vector<double> all(NRANKS);
         all[rank] = us;
         bootstrap->allGather(all.data(), sizeof(double));
@@ -1130,7 +1163,8 @@ static void runRank(int rank, mscclpp::UniqueId id, Cfg const& cfg) {
         std::vector<double> errs(NRANKS);
         errs[rank] = relerr;
         bootstrap->allGather(errs.data(), sizeof(double));
-        worstErr = std::max(worstErr, *std::max_element(errs.begin(), errs.end()));
+        worstErr =
+            std::max(worstErr, *std::max_element(errs.begin(), errs.end()));
         if (rank == 0 && i >= cfg.warmup)
           std::printf("# sample,%zu,%s,%d,%.3f,%.3e\n", bytes,
                       kAlgoName[a], i - cfg.warmup + 1, worst,
@@ -1167,6 +1201,16 @@ int main(int argc, char** argv) {
       cfg.minBytes = std::strtoull(next(), nullptr, 0);
     else if (k == "-e")
       cfg.maxBytes = std::strtoull(next(), nullptr, 0);
+    else if (k == "--sm-variants")
+      cfg.smVariants = true;
+    else if (k == "--fast-sweep")
+      cfg.fastSweep = true;
+    else if (k == "--sm-blocks")
+      cfg.smBlocks = std::atoi(next());
+    else if (k == "--allocation-bytes")
+      cfg.allocationBytes = std::strtoull(next(), nullptr, 0);
+    else if (k == "-a")
+      cfg.onlyAlgo = std::atoi(next());
     else if (k == "-n")
       cfg.iters = std::atoi(next());
     else if (k == "-w")
@@ -1201,6 +1245,15 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "unknown arg %s\n", k.c_str());
       return 1;
     }
+  }
+
+  if (cfg.smBlocks < 0 || cfg.smBlocks > 32) {
+    std::fprintf(stderr, "invalid SM block count\n");
+    return 1;
+  }
+  if (cfg.onlyAlgo < -1 || cfg.onlyAlgo >= NALGO) {
+    std::fprintf(stderr, "invalid algorithm index\n");
+    return 1;
   }
 
   // Fork before touching CUDA so every rank gets a clean context. The unique id

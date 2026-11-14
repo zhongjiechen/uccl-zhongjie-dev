@@ -119,6 +119,40 @@ help:
 	@printf '%s\n' '  make host-memory-bw-triad: NUMA-local large-working-set host DRAM probe'
 	@printf '%s\n' '  make peer-ag-rs-packet: FP32 AllGather peer paths plus optional host-packet router'
 
+	@printf '%s\n' '  make peer-ring-check: signed-input asynchronous ring RS check' '  make peer-hybrid-allreduce peer-hybrid-check: experimental in-place ring/packet AR and independent check'
+
+	@printf '%s\n' '  make peer-small-medium-check: phased LL and host-gather checks' '  make resident-collectives resident-check: experimental prepared collectives and boundary checks'
+
 include src/cpu_router/module.mk
 
 -include $(wildcard $(BUILD)/*.d)
+
+.PHONY: peer-ring-check
+peer-ring-check: $(BUILD)/uccl_lite_peer_ring_check
+$(BUILD)/uccl_lite_peer_ring_check: tests/collectives/peer_ring_check.cu src/collectives/peer_ag_rs.cu | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -std=c++17 $(MSCCLPP_INC) -I$(NCCL_HOME)/include $< -o $@ -L$(NCCL_HOME)/lib -lnccl -Xlinker -rpath=$(NCCL_HOME)/lib
+
+.PHONY: peer-hybrid-allreduce
+peer-hybrid-allreduce: $(BUILD)/uccl_lite_peer_hybrid_allreduce
+$(BUILD)/uccl_lite_peer_hybrid_allreduce: src/collectives/peer_hybrid_allreduce.cu src/collectives/peer_ag_rs.cu $(BUILD)/cpu_router/libuccl_lite_cpu_router.a | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -std=c++17 -DUCCL_LITE_PACKET_ROUTER $(MSCCLPP_INC) $(ROUTER_INC) -I$(NCCL_HOME)/include $< $(ROUTER_STATIC) -o $@ -L$(NCCL_HOME)/lib -lnccl -Xlinker -rpath=$(NCCL_HOME)/lib -Xcompiler=-pthread -ldl
+
+.PHONY: peer-hybrid-check
+peer-hybrid-check: $(BUILD)/uccl_lite_peer_hybrid_check
+$(BUILD)/uccl_lite_peer_hybrid_check: tests/collectives/peer_hybrid_check.cu src/collectives/peer_ag_rs.cu $(BUILD)/cpu_router/libuccl_lite_cpu_router.a | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -std=c++17 -DUCCL_LITE_PACKET_ROUTER $(MSCCLPP_INC) $(ROUTER_INC) -I$(NCCL_HOME)/include $< $(ROUTER_STATIC) -o $@ -L$(NCCL_HOME)/lib -lnccl -Xlinker -rpath=$(NCCL_HOME)/lib -Xcompiler=-pthread -ldl
+
+.PHONY: peer-small-medium-check
+peer-small-medium-check: $(BUILD)/uccl_lite_peer_small_medium_check
+$(BUILD)/uccl_lite_peer_small_medium_check: tests/collectives/peer_small_medium_check.cu src/collectives/peer_ag_rs.cu | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -std=c++17 $(MSCCLPP_INC) -I$(NCCL_HOME)/include $< -o $@ -L$(NCCL_HOME)/lib -lnccl -Xlinker -rpath=$(NCCL_HOME)/lib
+
+.PHONY: resident-collectives
+resident-collectives: $(BUILD)/uccl_lite_resident_collectives
+$(BUILD)/uccl_lite_resident_collectives: src/collectives/resident_collectives.cu src/collectives/peer_ag_rs.cu | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -std=c++17 $(MSCCLPP_INC) -I$(NCCL_HOME)/include $< -o $@ -L$(NCCL_HOME)/lib -lnccl -Xlinker -rpath=$(NCCL_HOME)/lib
+
+.PHONY: resident-check
+resident-check: $(BUILD)/uccl_lite_resident_check
+$(BUILD)/uccl_lite_resident_check: tests/collectives/resident_check.cu src/collectives/resident_collectives.cu src/collectives/peer_ag_rs.cu | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -std=c++17 $(MSCCLPP_INC) -I$(NCCL_HOME)/include $< -o $@ -L$(NCCL_HOME)/lib -lnccl -Xlinker -rpath=$(NCCL_HOME)/lib

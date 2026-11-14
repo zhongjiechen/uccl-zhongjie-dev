@@ -1,15 +1,17 @@
 // Four-GPU direct peer AllGather and ReduceScatter benchmark.
 // Every destination owns its output; source tensors stay immutable until all
 // peer copies and the destination reduction have completed.
+#include <mscclpp/packet_device.hpp>
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 #include <nccl.h>
-#include <mscclpp/packet_device.hpp>
 #ifdef UCCL_LITE_PACKET_ROUTER
 #include "uccl_lite/cpu_router/packet_pipeline.hpp"
 #endif
 #include <linux/mempolicy.h>
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -32,9 +34,12 @@ bool directSelfReduce(size_t fullBytes) {
          (fullBytes >= (1UL << 20) && fullBytes <= (8UL << 20)) ||
          fullBytes >= (32UL << 20);
 }
-void cudaCheck(cudaError_t status) {
-  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+void cudaCheckAt(cudaError_t status, int line) {
+  if (status != cudaSuccess)
+    throw std::runtime_error("CUDA line " + std::to_string(line) + ": " +
+                             cudaGetErrorString(status));
 }
+#define cudaCheck(status) cudaCheckAt((status), __LINE__)
 void ncclCheck(ncclResult_t status) {
   if (status != ncclSuccess) throw std::runtime_error(ncclGetErrorString(status));
 }
@@ -43,23 +48,40 @@ struct Config {
   size_t pullMaxBytes = 32UL << 10;
   size_t pullVecMaxBytes = 0;
   size_t pushSerialMaxBytes = 2UL << 20;
+  size_t pushGridMaxBytes = 0;
+  size_t miniHostMaxBytes = 0;
+  int pushGridBlocks = 8;
+  int serialThreads = 0;
   size_t rsPushSerialMaxBytes = 8UL << 20;
   size_t rsLlMaxBytes = 8UL << 10;
+  size_t rsHierLlMaxBytes = 0;
+  size_t rsGridMaxBytes = 0;
   size_t rsFenceMaxBytes = 1UL << 20;
   size_t routerChunkBytes = 4UL << 20;
   size_t packetRouterMinBytes = 4UL << 20;
+  size_t packetBytes = 4UL << 20;
+  int packetBlocks = 248;
+  bool graph = false;
   int warmups = 5, iterations = 10, repeats = 3;
   bool routerAg = false;
   bool packetRouterAg = false;
   bool packetRouterGpuProgress = false;
   bool packetRouterPerSource = false;
   bool rsOnly = false;
+  bool agOnly = false;
+  bool rsHier = false;
+  bool rsRing = false;
+  size_t rsRingChunkBytes = 8UL << 20;
   bool routerLocalNuma = true;
 };
 Config parse(int argc, char** argv) {
   Config cfg;
   for (int i = 1; i < argc; ++i) {
     std::string option = argv[i];
+    if (option == "--graph") {
+      cfg.graph = true;
+      continue;
+    }
     if (option == "--router-ag") {
       cfg.routerAg = true;
       continue;
@@ -77,25 +99,44 @@ Config parse(int argc, char** argv) {
       cfg.packetRouterPerSource = true;
       continue;
     }
+    if (option == "--rs-ring") {
+      cfg.rsRing = true;
+      continue;
+    }
+    if (option == "--rs-hier") {
+      cfg.rsHier = true;
+      continue;
+    }
+    if (option == "--ag-only") {
+      cfg.agOnly = true;
+      continue;
+    }
     if (option == "--rs-only") {
       cfg.rsOnly = true;
       continue;
     }
     if (option == "--help") {
-      std::puts("Usage: uccl_lite_peer_ag_rs [-b BYTES] [-e BYTES] "
-                "[-w WARMUPS] [-n ITERATIONS] [-r REPEATS] "
-                "[--pull-max-bytes BYTES] [--pull-vec-max-bytes BYTES] "
-                "[--push-serial-max-bytes BYTES] "
-                "[--rs-push-serial-max-bytes BYTES] "
-                "[--rs-ll-max-bytes BYTES] "
-                "[--rs-fence-max-bytes BYTES] "
-                "[--router-ag] [--packet-router-ag] [--rs-only] "
-                "[--packet-router-min-bytes BYTES] "
-                "[--packet-router-gpu-progress|--packet-router-per-source] "
-                "[--router-chunk-bytes BYTES] "
-                "[--router-host-placement local|cuda]\n"
-                "BYTES is full AllGather output / ReduceScatter input per "
-                "rank; requires four peer-accessible GPUs.");
+      std::puts(
+          "Usage: uccl_lite_peer_ag_rs [-b BYTES] [-e BYTES] "
+          "[-w WARMUPS] [-n ITERATIONS] [-r REPEATS] "
+          "[--pull-max-bytes BYTES] [--pull-vec-max-bytes BYTES] "
+          "[--push-serial-max-bytes BYTES] "
+          "[--push-grid-max-bytes BYTES] [--push-grid-blocks BLOCKS] "
+          "[--serial-threads THREADS] [--mini-host-max-bytes BYTES] "
+          "[--rs-push-serial-max-bytes BYTES] "
+          "[--rs-ll-max-bytes BYTES] [--rs-hier-ll-max-bytes BYTES] "
+          "[--rs-grid-max-bytes BYTES] "
+          "[--rs-fence-max-bytes BYTES] [--rs-ring-chunk-bytes BYTES] "
+          "[--router-ag] [--packet-router-ag] [--rs-only] [--ag-only] "
+          "[--rs-hier] "
+          "[--rs-ring] "
+          "[--packet-router-min-bytes BYTES] [--packet-bytes BYTES] "
+          "[--packet-blocks BLOCKS] [--graph] "
+          "[--packet-router-gpu-progress|--packet-router-per-source] "
+          "[--router-chunk-bytes BYTES] "
+          "[--router-host-placement local|cuda]\n"
+          "BYTES is full AllGather output / ReduceScatter input per "
+          "rank; requires four peer-accessible GPUs.");
       std::exit(0);
     }
     if (i + 1 == argc) throw std::invalid_argument("missing option value");
@@ -109,16 +150,34 @@ Config parse(int argc, char** argv) {
       cfg.pullMaxBytes = std::strtoull(value, nullptr, 0);
     else if (option == "--pull-vec-max-bytes")
       cfg.pullVecMaxBytes = std::strtoull(value, nullptr, 0);
+    else if (option == "--mini-host-max-bytes")
+      cfg.miniHostMaxBytes = std::strtoull(value, nullptr, 0);
+    else if (option == "--push-grid-max-bytes")
+      cfg.pushGridMaxBytes = std::strtoull(value, nullptr, 0);
+    else if (option == "--serial-threads")
+      cfg.serialThreads = std::atoi(value);
+    else if (option == "--push-grid-blocks")
+      cfg.pushGridBlocks = std::atoi(value);
     else if (option == "--push-serial-max-bytes")
       cfg.pushSerialMaxBytes = std::strtoull(value, nullptr, 0);
     else if (option == "--rs-push-serial-max-bytes")
       cfg.rsPushSerialMaxBytes = std::strtoull(value, nullptr, 0);
+    else if (option == "--rs-grid-max-bytes")
+      cfg.rsGridMaxBytes = std::strtoull(value, nullptr, 0);
+    else if (option == "--rs-hier-ll-max-bytes")
+      cfg.rsHierLlMaxBytes = std::strtoull(value, nullptr, 0);
     else if (option == "--rs-ll-max-bytes")
       cfg.rsLlMaxBytes = std::strtoull(value, nullptr, 0);
+    else if (option == "--rs-ring-chunk-bytes")
+      cfg.rsRingChunkBytes = std::strtoull(value, nullptr, 0);
     else if (option == "--rs-fence-max-bytes")
       cfg.rsFenceMaxBytes = std::strtoull(value, nullptr, 0);
     else if (option == "--router-chunk-bytes")
       cfg.routerChunkBytes = std::strtoull(value, nullptr, 0);
+    else if (option == "--packet-bytes")
+      cfg.packetBytes = std::strtoull(value, nullptr, 0);
+    else if (option == "--packet-blocks")
+      cfg.packetBlocks = std::atoi(value);
     else if (option == "--packet-router-min-bytes")
       cfg.packetRouterMinBytes = std::strtoull(value, nullptr, 0);
     else if (option == "--router-host-placement") {
@@ -129,18 +188,40 @@ Config parse(int argc, char** argv) {
     }
     else throw std::invalid_argument("unknown option: " + option);
   }
-  if (cfg.begin < 16 || cfg.begin > cfg.end || cfg.begin % 16 ||
-      cfg.end % 16 || cfg.routerChunkBytes < 16 ||
-      cfg.routerChunkBytes % 16 || cfg.packetRouterMinBytes % 16 ||
-      cfg.warmups < 0 || cfg.iterations < 1 ||
-      cfg.repeats < 1)
+  if (cfg.begin < 16 || cfg.begin > cfg.end || cfg.begin % 16 || cfg.end % 16 ||
+      cfg.rsRingChunkBytes < 4096 || cfg.rsRingChunkBytes % 16 ||
+      cfg.routerChunkBytes < 16 || cfg.routerChunkBytes % 16 ||
+      cfg.packetRouterMinBytes % 16 || cfg.packetBytes < 4096 ||
+      cfg.packetBytes % 16 || cfg.packetBlocks < 4 || cfg.packetBlocks > 248 ||
+      cfg.pushGridBlocks < 1 || cfg.pushGridBlocks > 32 ||
+      (cfg.serialThreads != 0 && cfg.serialThreads != 128 &&
+       cfg.serialThreads != 256 && cfg.serialThreads != 512 &&
+       cfg.serialThreads != 1024) ||
+      cfg.warmups < 0 || cfg.iterations < 1 || cfg.repeats < 1)
     throw std::invalid_argument("invalid size or iteration settings");
+  if (cfg.miniHostMaxBytes && cfg.graph)
+    throw std::invalid_argument("mini host is an eager-only candidate");
+  if (cfg.miniHostMaxBytes &&
+      (cfg.miniHostMaxBytes < 16 || cfg.miniHostMaxBytes % 16 ||
+       cfg.pushGridBlocks < 4 || cfg.pushGridBlocks % 4))
+    throw std::invalid_argument(
+        "mini host requires aligned capacity and a multiple of 4 blocks");
+  if (cfg.agOnly && cfg.rsOnly)
+    throw std::invalid_argument("--ag-only and --rs-only conflict");
   if (cfg.routerAg && cfg.rsOnly)
     throw std::invalid_argument("--router-ag and --rs-only conflict");
+  if (cfg.graph &&
+      (cfg.rsRing || cfg.rsHier || cfg.end > (1UL << 20) ||
+       cfg.end > cfg.pushSerialMaxBytes || cfg.end > cfg.rsPushSerialMaxBytes))
+    throw std::invalid_argument(
+        "graph mode supports SM candidates through 1 MiB");
+  if (cfg.graph && (cfg.routerAg || cfg.packetRouterAg))
+    throw std::invalid_argument("graph mode currently supports peer/NCCL only");
   if (cfg.packetRouterAg && (cfg.routerAg || cfg.rsOnly))
     throw std::invalid_argument("--packet-router-ag requires AllGather only");
   if (cfg.packetRouterGpuProgress && !cfg.packetRouterAg)
-    throw std::invalid_argument("packet-router progress requires --packet-router-ag");
+    throw std::invalid_argument(
+        "packet-router progress requires --packet-router-ag");
 #ifndef UCCL_LITE_PACKET_ROUTER
   if (cfg.packetRouterAg)
     throw std::invalid_argument("build peer-ag-rs-packet for --packet-router-ag");
@@ -149,6 +230,8 @@ Config parse(int argc, char** argv) {
 }
 struct Device {
   int rank;
+  int pushGridBlocks = 8;
+  int serialThreads = 0;
   float *input = nullptr, *output = nullptr, *scratch = nullptr,
         *reference = nullptr;
   mscclpp::LL16Packet* packets = nullptr;
@@ -157,7 +240,12 @@ struct Device {
   cudaStream_t stream = nullptr;
   cudaEvent_t start = nullptr, end = nullptr, transferDone = nullptr,
               reduceDone = nullptr, transferAllDone = nullptr;
-  Device(int r, size_t bytes, size_t llBytes, bool needFlags) : rank(r) {
+  cudaStream_t ringReduce = nullptr;
+  size_t ringChunk = 0, ringTiles = 0;
+  std::vector<cudaEvent_t> ringArrived, ringReduced;
+  Device(int r, size_t bytes, size_t llBytes, bool needFlags,
+         size_t ringChunkBytes = 0)
+      : rank(r) {
     cudaCheck(cudaSetDevice(rank));
     cudaCheck(cudaMalloc(&input, bytes));
     cudaCheck(cudaMalloc(&output, bytes));
@@ -173,6 +261,18 @@ struct Device {
     cudaCheck(cudaMalloc(&reference, bytes));
     cudaCheck(cudaMalloc(&wrong, sizeof(unsigned int)));
     cudaCheck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    if (ringChunkBytes) {
+      ringChunk = ringChunkBytes / sizeof(float);
+      ringTiles =
+          (bytes / (kRanks * sizeof(float)) + ringChunk - 1) / ringChunk;
+      cudaCheck(cudaStreamCreateWithFlags(&ringReduce, cudaStreamNonBlocking));
+      ringArrived.resize(3 * ringTiles);
+      ringReduced.resize(3 * ringTiles);
+      for (auto& event : ringArrived)
+        cudaCheck(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+      for (auto& event : ringReduced)
+        cudaCheck(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&end));
     cudaCheck(cudaEventCreateWithFlags(&transferDone, cudaEventDisableTiming));
@@ -181,6 +281,9 @@ struct Device {
   }
   ~Device() {
     cudaSetDevice(rank);
+    for (auto event : ringArrived) cudaEventDestroy(event);
+    for (auto event : ringReduced) cudaEventDestroy(event);
+    if (ringReduce) cudaStreamDestroy(ringReduce);
     if (transferAllDone) cudaEventDestroy(transferAllDone);
     if (reduceDone) cudaEventDestroy(reduceDone);
     if (transferDone) cudaEventDestroy(transferDone);
@@ -273,6 +376,25 @@ __global__ void pushSerialGather(float const* input, float* out0,
     __syncthreads();
   }
 }
+__global__ void pushGridGather(float const* input, float* out0, float* out1,
+                               float* out2, float* out3, size_t shard,
+                               int source) {
+  auto grid = cooperative_groups::this_grid();
+  float* targets[4] = {out0, out1, out2, out3};
+  for (int phase = 0; phase < kRanks; ++phase) {
+    int dest = (source + phase) % kRanks;
+    float* output = targets[dest] + size_t(source) * shard;
+    if (shard % 4 == 0) {
+      auto const* in = reinterpret_cast<uint4 const*>(input);
+      auto* out = reinterpret_cast<uint4*>(output);
+      for (size_t i = grid.thread_rank(); i < shard / 4; i += grid.size())
+        out[i] = in[i];
+    } else
+      for (size_t i = grid.thread_rank(); i < shard; i += grid.size())
+        output[i] = input[i];
+    grid.sync();
+  }
+}
 __global__ void pushSerialScatter(float const* input, float* scratch0,
                                   float* scratch1, float* scratch2,
                                   float* scratch3, size_t shard, int source,
@@ -321,6 +443,52 @@ __global__ void scatterPacketLL(float const* input, float* output,
       sum.y += __uint_as_float(value.y);
     }
     reinterpret_cast<float2*>(output)[i] = sum;
+  }
+}
+// Local pair reduction retains parity shards; cross-pair reduction produces
+// the final rank-owned shard. LL packets publish each float2 with its
+// generation. Like the original packet candidate, this path requires all-rank
+// completion before reuse (the eager harness supplies that boundary).
+__global__ void scatterHierLL(float const* input, float* output,
+                              mscclpp::LL16Packet* p0, mscclpp::LL16Packet* p1,
+                              mscclpp::LL16Packet* p2, mscclpp::LL16Packet* p3,
+                              size_t shard, int rank, uint32_t flag) {
+  auto grid = cooperative_groups::this_grid();
+  mscclpp::LL16Packet* packets[4] = {p0, p1, p2, p3};
+  size_t units = shard / 2;
+  size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = size_t(gridDim.x) * blockDim.x;
+  auto const* in = reinterpret_cast<float2 const*>(input);
+  for (size_t i = tid; i < units; i += stride) {
+    int local = rank ^ 1, cross = rank ^ 2;
+    for (int k = 0; k < 2; ++k) {
+      float2 value = in[size_t(local ^ (k * 2)) * units + i];
+      packets[local][k * units + i].write(
+          make_uint2(__float_as_uint(value.x), __float_as_uint(value.y)), flag);
+    }
+  }
+  grid.sync();
+  for (size_t i = tid; i < units; i += stride) {
+    int cross = rank ^ 2;
+    float2 own = in[size_t(rank) * units + i];
+    float2 other = in[size_t(cross) * units + i];
+    uint2 a = packets[rank][i].read(flag);
+    uint2 b = packets[rank][units + i].read(flag);
+    own.x += __uint_as_float(a.x);
+    own.y += __uint_as_float(a.y);
+    other.x += __uint_as_float(b.x);
+    other.y += __uint_as_float(b.y);
+    packets[cross][2 * units + i].write(
+        make_uint2(__float_as_uint(other.x), __float_as_uint(other.y)), flag);
+    reinterpret_cast<float2*>(output)[i] = own;
+  }
+  grid.sync();
+  for (size_t i = tid; i < units; i += stride) {
+    float2 own = reinterpret_cast<float2*>(output)[i];
+    uint2 c = packets[rank][2 * units + i].read(flag);
+    own.x += __uint_as_float(c.x);
+    own.y += __uint_as_float(c.y);
+    reinterpret_cast<float2*>(output)[i] = own;
   }
 }
 __device__ void releaseSystemFlag(uint32_t* address, uint32_t value) {
@@ -394,6 +562,67 @@ __global__ void scatterFenceFused(float const* input, float* output,
       output[i] = value;
     }
 }
+__global__ void scatterGridFused(float const* input, float* output,
+                                 float* scratch0, float* scratch1,
+                                 float* scratch2, float* scratch3,
+                                 uint32_t* flags0, uint32_t* flags1,
+                                 uint32_t* flags2, uint32_t* flags3,
+                                 size_t shard, int rank, uint32_t flag) {
+  auto grid = cooperative_groups::this_grid();
+  float* scratches[4] = {scratch0, scratch1, scratch2, scratch3};
+  uint32_t* flags[4] = {flags0, flags1, flags2, flags3};
+  for (int phase = 1; phase < kRanks; ++phase) {
+    int dest = (rank + phase) % kRanks;
+    float const* from = input + size_t(dest) * shard;
+    float* to = scratches[dest] + size_t(rank) * shard;
+    if (shard % 4 == 0) {
+      auto const* in = reinterpret_cast<uint4 const*>(from);
+      auto* out = reinterpret_cast<uint4*>(to);
+      for (size_t i = grid.thread_rank(); i < shard / 4; i += grid.size())
+        out[i] = in[i];
+    } else
+      for (size_t i = grid.thread_rank(); i < shard; i += grid.size())
+        to[i] = from[i];
+    grid.sync();
+  }
+  // Every thread publishes its own peer stores before one leader signals.
+  __threadfence_system();
+  grid.sync();
+  if (grid.thread_rank() == 0) {
+    for (int dest = 0; dest < kRanks; ++dest)
+      if (dest != rank) releaseSystemFlag(flags[dest] + rank, flag);
+    for (int source = 0; source < kRanks; ++source) {
+      if (source == rank) continue;
+      while (acquireSystemFlag(flags[rank] + source) != flag) __nanosleep(64);
+    }
+  }
+  grid.sync();
+  if (shard % 4 == 0) {
+    auto const* own =
+        reinterpret_cast<float4 const*>(input + size_t(rank) * shard);
+    auto const* peer = reinterpret_cast<float4 const*>(scratches[rank]);
+    auto* out = reinterpret_cast<float4*>(output);
+    for (size_t i = grid.thread_rank(); i < shard / 4; i += grid.size()) {
+      float4 value = own[i];
+      for (int source = 0; source < kRanks; ++source) {
+        if (source == rank) continue;
+        float4 remote = peer[size_t(source) * (shard / 4) + i];
+        value.x += remote.x;
+        value.y += remote.y;
+        value.z += remote.z;
+        value.w += remote.w;
+      }
+      out[i] = value;
+    }
+  } else
+    for (size_t i = grid.thread_rank(); i < shard; i += grid.size()) {
+      float value = input[size_t(rank) * shard + i];
+      for (int source = 0; source < kRanks; ++source)
+        if (source != rank)
+          value += scratches[rank][size_t(source) * shard + i];
+      output[i] = value;
+    }
+}
 __global__ void pullScatter(float const* in0, float const* in1,
                             float const* in2, float const* in3, float* output,
                             size_t shard, int destination) {
@@ -407,12 +636,33 @@ __global__ void pullScatter(float const* in0, float const* in1,
   output[index] = value;
 }
 enum class Operation { Gather, Scatter };
-enum class Backend { Peer, Pull, Nccl, Router, PacketRouter, PullVec, PushSerial,
-                     ScatterLL, ScatterFence };
+enum class Backend {
+  Peer,
+  Pull,
+  Nccl,
+  Router,
+  PacketRouter,
+  PullVec,
+  PushSerial,
+  ScatterLL,
+  ScatterFence,
+  ScatterHier,
+  ScatterRing,
+  PushGrid,
+  MiniHost,
+  ScatterHierLL,
+  ScatterGrid
+};
 char const* opName(Operation op) {
   return op == Operation::Gather ? "all_gather" : "reduce_scatter";
 }
 char const* backendName(Backend backend) {
+  if (backend == Backend::ScatterGrid) return "scatter-grid";
+  if (backend == Backend::ScatterHierLL) return "scatter-hier-ll";
+  if (backend == Backend::MiniHost) return "mini-host";
+  if (backend == Backend::PushGrid) return "push-grid";
+  if (backend == Backend::ScatterRing) return "scatter-ring";
+  if (backend == Backend::ScatterHier) return "scatter-hier";
   if (backend == Backend::Peer) return "peer";
   if (backend == Backend::Pull) return "pull";
   if (backend == Backend::PullVec) return "pull-vec";
@@ -513,11 +763,10 @@ struct HostRouter {
           for (int dest = 0; dest < kRanks; ++dest)
             cudaCheck(cudaStreamWaitEvent(uploads[source],
                                           consumed[dest][slot], 0));
-        cudaCheck(cudaMemcpyAsync(stage[source][slot],
-                                  reinterpret_cast<char*>(devices[source]->input) +
-                                      offset,
-                                  count, cudaMemcpyDeviceToHost,
-                                  uploads[source]));
+        cudaCheck(cudaMemcpyAsync(
+            stage[source][slot],
+            reinterpret_cast<char*>(devices[source]->input) + offset, count,
+            cudaMemcpyDeviceToHost, uploads[source]));
         cudaCheck(cudaEventRecord(ready[source][slot], uploads[source]));
       }
       for (int dest = 0; dest < kRanks; ++dest) {
@@ -527,14 +776,97 @@ struct HostRouter {
         for (int source = 0; source < kRanks; ++source) {
           cudaCheck(cudaStreamWaitEvent(devices[dest]->stream,
                                         ready[source][slot], 0));
-          cudaCheck(cudaMemcpyAsync(
-              reinterpret_cast<char*>(devices[dest]->output) +
-                  size_t(source) * shardBytes + offset,
-              stage[source][slot], count, cudaMemcpyHostToDevice,
-              devices[dest]->stream));
+          cudaCheck(
+              cudaMemcpyAsync(reinterpret_cast<char*>(devices[dest]->output) +
+                                  size_t(source) * shardBytes + offset,
+                              stage[source][slot], count,
+                              cudaMemcpyHostToDevice, devices[dest]->stream));
         }
         cudaCheck(cudaEventRecord(consumed[dest][slot], devices[dest]->stream));
       }
+    }
+  }
+};
+// One resident cooperative grid: upload once, then gather independently ready
+// sources. Reader credits protect the single host bank across eager calls.
+__global__ void miniHostGather(float const* input, float* output, float* h0,
+                               float* h1, float* h2, float* h3, uint32_t* flags,
+                               size_t shard, int rank, uint32_t generation) {
+  auto grid = cooperative_groups::this_grid();
+  float* host[4] = {h0, h1, h2, h3};
+  if (grid.thread_rank() == 0)
+    for (int r = 0; r < kRanks; ++r)
+      while (acquireSystemFlag(flags + (4 + r) * 32) != generation - 1)
+        __nanosleep(64);
+  grid.sync();
+  if (shard % 4 == 0) {
+    auto* to = reinterpret_cast<uint4*>(host[rank]);
+    auto const* from = reinterpret_cast<uint4 const*>(input);
+    for (size_t i = grid.thread_rank(); i < shard / 4; i += grid.size())
+      to[i] = from[i];
+  } else
+    for (size_t i = grid.thread_rank(); i < shard; i += grid.size())
+      host[rank][i] = input[i];
+  __threadfence_system();
+  grid.sync();
+  if (grid.thread_rank() == 0) releaseSystemFlag(flags + rank * 32, generation);
+  int source = blockIdx.x % kRanks;
+  if (threadIdx.x == 0 && source != rank)
+    while (acquireSystemFlag(flags + source * 32) != generation)
+      __nanosleep(64);
+  __syncthreads();
+  size_t tid = (blockIdx.x / kRanks) * blockDim.x + threadIdx.x;
+  size_t stride = (gridDim.x / kRanks) * blockDim.x;
+  float const* from = source == rank ? input : host[source];
+  float* to = output + size_t(source) * shard;
+  if (shard % 4 == 0) {
+    for (size_t i = tid; i < shard / 4; i += stride)
+      reinterpret_cast<uint4*>(to)[i] = reinterpret_cast<uint4 const*>(from)[i];
+  } else
+    for (size_t i = tid; i < shard; i += stride) to[i] = from[i];
+  grid.sync();
+  if (grid.thread_rank() == 0)
+    releaseSystemFlag(flags + (4 + rank) * 32, generation);
+}
+struct MiniHost {
+  HostRouter storage;
+  std::array<float*, 4> host{};
+  uint32_t* flags = nullptr;
+  uint32_t generation = 0;
+  int blocks;
+  static size_t checkedShardBytes(size_t bytes, int gridBlocks) {
+    if (bytes < 16 || bytes % 16 || gridBlocks < 4 || gridBlocks > 32 ||
+        gridBlocks % 4)
+      throw std::invalid_argument("invalid mini host preparation");
+    return bytes / 4;
+  }
+  MiniHost(size_t bytes, int gridBlocks)
+      : storage(checkedShardBytes(bytes, gridBlocks), true),
+        blocks(gridBlocks) {
+    for (int rank = 0; rank < kRanks; ++rank) {
+      cudaCheck(cudaSetDevice(rank));
+      cudaCheck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host[rank]),
+                                         storage.stage[rank][0], 0));
+    }
+    cudaCheck(cudaHostAlloc(reinterpret_cast<void**>(&flags), 8 * 128,
+                            cudaHostAllocPortable | cudaHostAllocMapped));
+    std::memset(flags, 0, 8 * 128);
+  }
+  ~MiniHost() { cudaFreeHost(flags); }
+  void launch(std::array<Device*, kRanks> const& devices, size_t shard) {
+    if (shard > storage.chunkBytes / sizeof(float))
+      throw std::invalid_argument("mini host extent exceeds preparation");
+    if (generation == UINT32_MAX)
+      throw std::runtime_error("mini host generation exhausted");
+    ++generation;
+    for (int rank = 0; rank < kRanks; ++rank) {
+      auto& d = *devices[rank];
+      cudaCheck(cudaSetDevice(rank));
+      void* args[] = {&d.input, &d.output, &host[0], &host[1], &host[2],
+                      &host[3], &flags,    &shard,   &rank,    &generation};
+      cudaCheck(cudaLaunchCooperativeKernel(
+          reinterpret_cast<void*>(miniHostGather), dim3(blocks), dim3(256),
+          args, 0, d.stream));
     }
   }
 };
@@ -542,9 +874,8 @@ void launchPeer(std::array<Device*, kRanks> const& devices, Operation op,
                 size_t shard) {
   size_t bytes = shard * sizeof(float);
   size_t fullBytes = bytes * kRanks;
-  bool compact = op == Operation::Gather
-                     ? fullBytes <= kCompactGatherBytes
-                     : fullBytes <= kCompactScatterBytes;
+  bool compact = op == Operation::Gather ? fullBytes <= kCompactGatherBytes
+                                         : fullBytes <= kCompactScatterBytes;
   bool directSelf = op == Operation::Scatter && directSelfReduce(fullBytes);
   for (int source = 0; source < kRanks; ++source) {
     auto& s = *devices[source];
@@ -602,6 +933,133 @@ void launchPeer(std::array<Device*, kRanks> const& devices, Operation op,
     cudaCheck(cudaGetLastError());
   }
 }
+// Local pairs first retain parity shards, then exchange one reduced shard
+// across sockets. Outputs are full-sized allocations in this eager harness;
+// the second shard holds an immutable outgoing partial until completion.
+__global__ void sumTwo(float const* a, float const* b, float* out, size_t n) {
+  for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    out[i] = a[i] + b[i];
+}
+void launchScatterHier(std::array<Device*, kRanks> const& devices,
+                       size_t shard) {
+  size_t bytes = shard * sizeof(float);
+  int blocks = int(std::min<size_t>(256, (shard + 255) / 256));
+  for (auto* d : devices) {
+    cudaCheck(cudaSetDevice(d->rank));
+    cudaCheck(cudaEventRecord(d->reduceDone, d->stream));
+  }
+  for (auto* d : devices) {
+    cudaCheck(cudaSetDevice(d->rank));
+    for (auto* peer : devices)
+      cudaCheck(cudaStreamWaitEvent(d->stream, peer->reduceDone, 0));
+  }
+  // Every source sends the two shards retained by its local peer.
+  for (int r = 0; r < kRanks; ++r) {
+    auto& d = *devices[r];
+    int peer = r ^ 1;
+    cudaCheck(cudaSetDevice(r));
+    for (int k = 0; k < 2; ++k) {
+      int owner = peer ^ (k * 2);
+      cudaCheck(cudaMemcpyPeerAsync(devices[peer]->scratch + k * shard, peer,
+                                    d.input + owner * shard, r, bytes,
+                                    d.stream));
+    }
+    cudaCheck(cudaEventRecord(d.transferDone, d.stream));
+  }
+  // Wait only for our local peer. Source outputs have disjoint ownership.
+  for (int r = 0; r < kRanks; ++r) {
+    auto& d = *devices[r];
+    cudaCheck(cudaSetDevice(r));
+    cudaCheck(cudaStreamWaitEvent(d.stream, devices[r ^ 1]->transferDone, 0));
+    for (int k = 0; k < 2; ++k)
+      sumTwo<<<blocks, 256, 0, d.stream>>>(d.input + (r ^ (k * 2)) * shard,
+                                           d.scratch + k * shard,
+                                           d.output + k * shard, shard);
+    cudaCheck(cudaEventRecord(d.reduceDone, d.stream));
+  }
+  // Do not overwrite peer scratch until its local partial has consumed it.
+  for (int r = 0; r < kRanks; ++r) {
+    auto& d = *devices[r];
+    cudaCheck(cudaSetDevice(r));
+    cudaCheck(cudaStreamWaitEvent(d.stream, devices[r ^ 2]->reduceDone, 0));
+    cudaCheck(cudaMemcpyPeerAsync(devices[r ^ 2]->scratch, r ^ 2,
+                                  d.output + shard, r, bytes, d.stream));
+    cudaCheck(cudaEventRecord(d.transferAllDone, d.stream));
+  }
+  for (int r = 0; r < kRanks; ++r) {
+    auto& d = *devices[r];
+    cudaCheck(cudaSetDevice(r));
+    cudaCheck(
+        cudaStreamWaitEvent(d.stream, devices[r ^ 2]->transferAllDone, 0));
+    sumTwo<<<blocks, 256, 0, d.stream>>>(d.output, d.scratch, d.output, shard);
+    cudaCheck(cudaEventRecord(d.reduceDone, d.stream));
+    cudaCheck(cudaGetLastError());
+  }
+}
+// Three-step bandwidth-balanced ring, with immutable per-step receive slots.
+void launchScatterRing(std::array<Device*, kRanks> const& devices,
+                       size_t shard) {
+  constexpr int ring[4] = {0, 1, 3, 2};
+  size_t chunk = devices[0]->ringChunk;
+  size_t tiles = (shard + chunk - 1) / chunk;
+  // Join the caller stream before the auxiliary reduction stream reads input.
+  for (auto* d : devices) {
+    cudaCheck(cudaSetDevice(d->rank));
+    cudaCheck(cudaEventRecord(d->reduceDone, d->stream));
+    cudaCheck(cudaStreamWaitEvent(d->ringReduce, d->reduceDone, 0));
+  }
+  // Protect all receive slots across asynchronous consecutive invocations.
+  // Waits bind to this generation's event record before the next call reuses
+  // it.
+  for (auto* d : devices) {
+    cudaCheck(cudaSetDevice(d->rank));
+    for (auto* peer : devices)
+      cudaCheck(cudaStreamWaitEvent(d->stream, peer->reduceDone, 0));
+  }
+  for (int step = 0; step < 3; ++step) {
+    for (size_t tile = 0; tile < tiles; ++tile) {
+      size_t offset = tile * chunk, count = std::min(chunk, shard - offset);
+      size_t eventIndex = step * devices[0]->ringTiles + tile;
+      for (int pos = 0; pos < kRanks; ++pos) {
+        int r = ring[pos], next = ring[(pos + 1) % 4];
+        int sendOwner = ring[(pos - step + 3) % 4];
+        auto& d = *devices[r];
+        cudaCheck(cudaSetDevice(r));
+        if (step)
+          cudaCheck(cudaStreamWaitEvent(
+              d.stream, d.ringReduced[eventIndex - d.ringTiles], 0));
+        float const* source = step == 0 ? d.input + sendOwner * shard
+                                        : d.scratch + (step - 1) * shard;
+        cudaCheck(cudaMemcpyPeerAsync(
+            devices[next]->scratch + step * shard + offset, next,
+            source + offset, r, count * sizeof(float), d.stream));
+        cudaCheck(cudaEventRecord(d.ringArrived[eventIndex], d.stream));
+      }
+      for (int pos = 0; pos < kRanks; ++pos) {
+        int r = ring[pos], prev = ring[(pos + 3) % 4];
+        int owner = ring[(pos - step + 2) % 4];
+        auto& d = *devices[r];
+        cudaCheck(cudaSetDevice(r));
+        cudaCheck(cudaStreamWaitEvent(
+            d.ringReduce, devices[prev]->ringArrived[eventIndex], 0));
+        float* incoming = d.scratch + step * shard + offset;
+        int blocks = int(std::min<size_t>(256, (count + 255) / 256));
+        sumTwo<<<blocks, 256, 0, d.ringReduce>>>(
+            d.input + owner * shard + offset, incoming,
+            step == 2 ? d.output + offset : incoming, count);
+        cudaCheck(cudaEventRecord(d.ringReduced[eventIndex], d.ringReduce));
+        cudaCheck(cudaGetLastError());
+      }
+    }
+  }
+  // Completion on the public stream includes all auxiliary work.
+  for (auto* d : devices) {
+    cudaCheck(cudaSetDevice(d->rank));
+    cudaCheck(cudaStreamWaitEvent(
+        d->stream, d->ringReduced[2 * d->ringTiles + tiles - 1], 0));
+  }
+}
 void launchPull(std::array<Device*, kRanks> const& devices, Operation op,
                 size_t shard) {
   // Inputs are immutable and fully published by fill() before this launch.
@@ -636,10 +1094,12 @@ void launchPullVec(std::array<Device*, kRanks> const& devices, size_t shard) {
     cudaCheck(cudaGetLastError());
   }
 }
-void launchPushSerial(std::array<Device*, kRanks> const& devices,
-                      Operation op, size_t shard) {
+void launchPushSerial(std::array<Device*, kRanks> const& devices, Operation op,
+                      size_t shard, int gridBlocks = 0) {
   size_t fullBytes = shard * kRanks * sizeof(float);
-  int threads = fullBytes == (64UL << 10) ? 128 : 256;
+  int threads = devices[0]->serialThreads   ? devices[0]->serialThreads
+                : fullBytes == (64UL << 10) ? 128
+                                            : 256;
   bool directSelf = op == Operation::Scatter && directSelfReduce(fullBytes);
   for (int source = 0; source < kRanks; ++source) {
     auto& d = *devices[source];
@@ -647,7 +1107,18 @@ void launchPushSerial(std::array<Device*, kRanks> const& devices,
     if (op == Operation::Scatter)
       for (int dest = 0; dest < kRanks; ++dest)
         cudaCheck(cudaStreamWaitEvent(d.stream, devices[dest]->reduceDone, 0));
-    if (op == Operation::Gather)
+    if (op == Operation::Gather && gridBlocks) {
+      void* args[] = {&d.input,
+                      &devices[0]->output,
+                      &devices[1]->output,
+                      &devices[2]->output,
+                      &devices[3]->output,
+                      &shard,
+                      &source};
+      cudaCheck(cudaLaunchCooperativeKernel(
+          reinterpret_cast<void*>(pushGridGather), dim3(gridBlocks),
+          dim3(threads), args, 0, d.stream));
+    } else if (op == Operation::Gather)
       pushSerialGather<<<1, threads, 0, d.stream>>>(
           d.input, devices[0]->output, devices[1]->output,
           devices[2]->output, devices[3]->output, shard, source);
@@ -674,33 +1145,66 @@ void launchPushSerial(std::array<Device*, kRanks> const& devices,
     }
   }
 }
-void launchScatterLL(std::array<Device*, kRanks> const& devices,
-                     size_t shard) {
+void launchScatterLL(std::array<Device*, kRanks> const& devices, size_t shard,
+                     bool hierarchical = false) {
   static uint32_t nextFlag = 1;
   uint32_t flag = nextFlag++;
   if (!flag) throw std::runtime_error("scatter packet flag exhausted");
   for (int rank = 0; rank < kRanks; ++rank) {
     auto& d = *devices[rank];
     cudaCheck(cudaSetDevice(rank));
-    scatterPacketLL<<<1, 256, 0, d.stream>>>(
-        d.input, d.output, devices[0]->packets, devices[1]->packets,
-        devices[2]->packets, devices[3]->packets, shard, rank, flag);
+    if (hierarchical) {
+      void* args[] = {&d.input,
+                      &d.output,
+                      &devices[0]->packets,
+                      &devices[1]->packets,
+                      &devices[2]->packets,
+                      &devices[3]->packets,
+                      &shard,
+                      &rank,
+                      &flag};
+      cudaCheck(cudaLaunchCooperativeKernel(
+          reinterpret_cast<void*>(scatterHierLL), dim3(d.pushGridBlocks),
+          dim3(256), args, 0, d.stream));
+    } else
+      scatterPacketLL<<<1, 256, 0, d.stream>>>(
+          d.input, d.output, devices[0]->packets, devices[1]->packets,
+          devices[2]->packets, devices[3]->packets, shard, rank, flag);
     cudaCheck(cudaGetLastError());
   }
 }
 void launchScatterFence(std::array<Device*, kRanks> const& devices,
-                        size_t shard) {
+                        size_t shard, bool grid = false) {
   static uint32_t nextFlag = 1;
   uint32_t flag = nextFlag++;
   if (!flag) throw std::runtime_error("scatter fence flag exhausted");
   for (int rank = 0; rank < kRanks; ++rank) {
     auto& d = *devices[rank];
     cudaCheck(cudaSetDevice(rank));
-    scatterFenceFused<<<1, 256, 0, d.stream>>>(
-        d.input, d.output, devices[0]->scratch, devices[1]->scratch,
-        devices[2]->scratch, devices[3]->scratch, devices[0]->flags,
-        devices[1]->flags, devices[2]->flags, devices[3]->flags,
-        shard, rank, flag);
+    if (grid) {
+      void* args[] = {&d.input,
+                      &d.output,
+                      &devices[0]->scratch,
+                      &devices[1]->scratch,
+                      &devices[2]->scratch,
+                      &devices[3]->scratch,
+                      &devices[0]->flags,
+                      &devices[1]->flags,
+                      &devices[2]->flags,
+                      &devices[3]->flags,
+                      &shard,
+                      &rank,
+                      &flag};
+      cudaCheck(cudaLaunchCooperativeKernel(
+          reinterpret_cast<void*>(scatterGridFused), dim3(d.pushGridBlocks),
+          dim3(256), args, 0, d.stream));
+    } else
+      scatterFenceFused<<<1, d.serialThreads ? d.serialThreads : 256, 0,
+                          d.stream>>>(d.input, d.output, devices[0]->scratch,
+                                      devices[1]->scratch, devices[2]->scratch,
+                                      devices[3]->scratch, devices[0]->flags,
+                                      devices[1]->flags, devices[2]->flags,
+                                      devices[3]->flags, shard, rank, flag);
     cudaCheck(cudaGetLastError());
   }
 }
@@ -727,9 +1231,9 @@ struct PacketRouter {
   static uccl_lite::cpu_router::PacketPipelineOptions options(Config const& cfg) {
     uccl_lite::cpu_router::PacketPipelineOptions result;
     result.maxTensorBytes = cfg.end;
-    result.packetBytes = 4UL << 20;
+    result.packetBytes = cfg.packetBytes;
     result.workersPerNode = 8;
-    result.transportBlocks = 248;
+    result.transportBlocks = cfg.packetBlocks;
     if (cfg.packetRouterGpuProgress) {
       result.reduction = uccl_lite::cpu_router::ReductionPlacement::Gpu;
       result.gpuProgress = true;
@@ -758,8 +1262,22 @@ struct PacketRouter {};
 void launch(std::array<Device*, kRanks> const& devices,
             std::array<ncclComm_t, kRanks> const& comms, Operation op,
             Backend backend, size_t shard, HostRouter* router,
-            PacketRouter* packetRouter) {
-  if (backend == Backend::Peer) launchPeer(devices, op, shard);
+            PacketRouter* packetRouter, MiniHost* miniHost = nullptr) {
+  if (backend == Backend::ScatterGrid)
+    launchScatterFence(devices, shard, true);
+  else if (backend == Backend::ScatterHierLL)
+    launchScatterLL(devices, shard, true);
+  else if (backend == Backend::MiniHost) {
+    if (!miniHost) throw std::invalid_argument("mini host not prepared");
+    miniHost->launch(devices, shard);
+  } else if (backend == Backend::PushGrid)
+    launchPushSerial(devices, op, shard, devices[0]->pushGridBlocks);
+  else if (backend == Backend::ScatterRing)
+    launchScatterRing(devices, shard);
+  else if (backend == Backend::ScatterHier)
+    launchScatterHier(devices, shard);
+  else if (backend == Backend::Peer)
+    launchPeer(devices, op, shard);
   else if (backend == Backend::Pull) launchPull(devices, op, shard);
   else if (backend == Backend::PullVec) launchPullVec(devices, shard);
   else if (backend == Backend::PushSerial) launchPushSerial(devices, op, shard);
@@ -821,23 +1339,63 @@ void verify(std::array<Device*, kRanks> const& devices, Operation op,
 double measure(std::array<Device*, kRanks> const& devices,
                std::array<ncclComm_t, kRanks> const& comms, Operation op,
                Backend backend, size_t shard, Config const& cfg, int repeat,
-               HostRouter* router, PacketRouter* packetRouter) {
+               HostRouter* router, PacketRouter* packetRouter,
+               MiniHost* miniHost = nullptr) {
   double timedSum = 0;
   double hostSum = 0;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t executable = nullptr;
+  if (cfg.graph) {
+    fill(devices, op, shard, 9);
+    cudaCheck(cudaSetDevice(0));
+    cudaCheck(cudaStreamBeginCapture(devices[0]->stream,
+                                     cudaStreamCaptureModeGlobal));
+    cudaCheck(cudaEventRecord(devices[0]->transferAllDone, devices[0]->stream));
+    for (auto* d : devices) {
+      cudaCheck(cudaSetDevice(d->rank));
+      if (d->rank)
+        cudaCheck(
+            cudaStreamWaitEvent(d->stream, devices[0]->transferAllDone, 0));
+      cudaCheck(cudaEventRecordWithFlags(d->start, d->stream,
+                                         cudaEventRecordExternal));
+      cudaCheck(cudaEventRecord(d->reduceDone, d->stream));
+    }
+    launch(devices, comms, op, backend, shard, router, packetRouter, miniHost);
+    for (auto* d : devices) {
+      cudaCheck(cudaSetDevice(d->rank));
+      cudaCheck(
+          cudaEventRecordWithFlags(d->end, d->stream, cudaEventRecordExternal));
+      cudaCheck(cudaEventRecord(d->transferAllDone, d->stream));
+    }
+    cudaCheck(cudaSetDevice(0));
+    for (int rank = 1; rank < kRanks; ++rank)
+      cudaCheck(cudaStreamWaitEvent(devices[0]->stream,
+                                    devices[rank]->transferAllDone, 0));
+    cudaCheck(cudaStreamEndCapture(devices[0]->stream, &graph));
+    cudaCheck(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+  }
   for (int n = 0; n < cfg.warmups + cfg.iterations; ++n) {
     int generation = 10 + repeat * (cfg.warmups + cfg.iterations) + n;
     fill(devices, op, shard, generation);
-    for (auto* d : devices) {
-      cudaCheck(cudaSetDevice(d->rank));
-      cudaCheck(cudaEventRecord(d->start, d->stream));
-    }
     auto hostStart = std::chrono::steady_clock::now();
-    launch(devices, comms, op, backend, shard, router, packetRouter);
-    for (auto* d : devices) {
-      cudaCheck(cudaSetDevice(d->rank));
-      cudaCheck(cudaEventRecord(d->end, d->stream));
+    if (cfg.graph) {
+      cudaCheck(cudaSetDevice(0));
+      cudaCheck(cudaGraphLaunch(executable, devices[0]->stream));
+      cudaCheck(cudaStreamSynchronize(devices[0]->stream));
+    } else {
+      for (auto* d : devices) {
+        cudaCheck(cudaSetDevice(d->rank));
+        cudaCheck(cudaEventRecord(d->start, d->stream));
+      }
+      hostStart = std::chrono::steady_clock::now();
+      launch(devices, comms, op, backend, shard, router, packetRouter,
+             miniHost);
+      for (auto* d : devices) {
+        cudaCheck(cudaSetDevice(d->rank));
+        cudaCheck(cudaEventRecord(d->end, d->stream));
+      }
+      synchronize(devices);
     }
-    synchronize(devices);
     auto hostEnd = std::chrono::steady_clock::now();
     double slowest = 0;
     for (auto* d : devices) {
@@ -866,6 +1424,19 @@ double measure(std::array<Device*, kRanks> const& devices,
     std::printf("# host_run_mean,%s,%zu,%s,%d,%.3f\n", opName(op),
                 shard * kRanks * sizeof(float), backendName(backend),
                 repeat + 1, hostSum / cfg.iterations);
+  if (executable) cudaCheck(cudaGraphExecDestroy(executable));
+  if (graph) cudaCheck(cudaGraphDestroy(graph));
+  if (cfg.graph) {
+    // Internal captured events encode dependencies rather than live records.
+    // Restore ordinary event state before a later eager/capture invocation.
+    for (auto* d : devices) {
+      cudaCheck(cudaSetDevice(d->rank));
+      cudaCheck(cudaEventRecord(d->reduceDone, d->stream));
+      cudaCheck(cudaEventRecord(d->transferDone, d->stream));
+      cudaCheck(cudaEventRecord(d->transferAllDone, d->stream));
+    }
+    synchronize(devices);
+  }
   return timedSum / cfg.iterations;
 }
 double median(std::vector<double> samples) {
@@ -897,15 +1468,23 @@ int main(int argc, char** argv) {
     std::array<Device*, kRanks> devices{};
     for (int rank = 0; rank < kRanks; ++rank) {
       owned[rank] = std::make_unique<Device>(
-          rank, cfg.end, std::min(cfg.end, cfg.rsLlMaxBytes),
-          cfg.rsFenceMaxBytes != 0);
+          rank, cfg.end,
+          std::min(cfg.end, std::max(cfg.rsLlMaxBytes, cfg.rsHierLlMaxBytes)),
+          (cfg.rsFenceMaxBytes != 0 || cfg.rsGridMaxBytes != 0),
+          cfg.rsRing ? cfg.rsRingChunkBytes : 0);
       devices[rank] = owned[rank].get();
+      devices[rank]->pushGridBlocks = cfg.pushGridBlocks;
+      devices[rank]->serialThreads = cfg.serialThreads;
     }
     std::array<ncclComm_t, kRanks> comms{};
     int ranks[kRanks] = {0, 1, 2, 3};
     ncclCheck(ncclCommInitAll(comms.data(), kRanks, ranks));
     int version = 0;
     ncclCheck(ncclGetVersion(&version));
+    std::unique_ptr<MiniHost> miniHost;
+    if (cfg.miniHostMaxBytes)
+      miniHost = std::make_unique<MiniHost>(
+          std::min(cfg.end, cfg.miniHostMaxBytes), cfg.pushGridBlocks);
     std::unique_ptr<HostRouter> router;
     if (cfg.routerAg)
       router = std::make_unique<HostRouter>(cfg.routerChunkBytes,
@@ -934,19 +1513,39 @@ int main(int argc, char** argv) {
                   router->hostNode[0], router->hostNode[1],
                   router->hostNode[2], router->hostNode[3]);
     if (cfg.packetRouterAg)
-      std::printf("# packet-router AG: FP32 bitwise copy, 8 workers/NUMA, "
-                  "transport-block cap=248, packet cap=4194304 B, "
-                  "candidate from %zu B; progress=%s\n",
-                  cfg.packetRouterMinBytes,
-                  cfg.packetRouterPerSource ? "gpu-per-source"
-                      : cfg.packetRouterGpuProgress ? "gpu-all-ready" : "cpu");
+      std::printf(
+          "# packet-router AG: FP32 bitwise copy, 8 workers/NUMA, "
+          "transport-block cap=%d, packet cap=%zu B, "
+          "candidate from %zu B; progress=%s\n",
+          cfg.packetBlocks, cfg.packetBytes, cfg.packetRouterMinBytes,
+          cfg.packetRouterPerSource     ? "gpu-per-source"
+          : cfg.packetRouterGpuProgress ? "gpu-all-ready"
+                                        : "cpu");
+    std::printf("# execution=%s; rs-ring-chunk=%zu B\n",
+                cfg.graph ? "graph-replay" : "eager", cfg.rsRingChunkBytes);
+    std::printf(
+        "# cooperative-blocks=%d serial-threads=%d mini-host-max=%zu "
+        "hier-ll-max=%zu scatter-grid-max=%zu\n",
+        cfg.pushGridBlocks, cfg.serialThreads, cfg.miniHostMaxBytes,
+        cfg.rsHierLlMaxBytes, cfg.rsGridMaxBytes);
     std::puts("collective,bytes,backend,median_us,min_us,max_us");
     for (size_t bytes = cfg.begin; bytes <= cfg.end; bytes *= 2) {
       size_t shard = bytes / sizeof(float) / kRanks;
       for (auto op : {Operation::Gather, Operation::Scatter}) {
         if (cfg.rsOnly && op == Operation::Gather) continue;
+        if (cfg.agOnly && op == Operation::Scatter) continue;
         if ((cfg.routerAg || cfg.packetRouterAg) && op == Operation::Scatter)
           continue;
+        bool rsGridEligible = !cfg.graph && op == Operation::Scatter &&
+                              bytes <= cfg.rsGridMaxBytes;
+        bool hierLlEligible = !cfg.graph && op == Operation::Scatter &&
+                              shard % 2 == 0 && bytes <= cfg.rsHierLlMaxBytes;
+        bool miniEligible =
+            op == Operation::Gather && bytes <= cfg.miniHostMaxBytes;
+        bool gridEligible =
+            op == Operation::Gather && bytes <= cfg.pushGridMaxBytes;
+        bool ringEligible = cfg.rsRing && op == Operation::Scatter;
+        bool hierEligible = cfg.rsHier && op == Operation::Scatter;
         bool packetEligible = cfg.packetRouterAg &&
                               bytes >= cfg.packetRouterMinBytes;
         bool pullEligible = bytes <= cfg.pullMaxBytes;
@@ -955,13 +1554,20 @@ int main(int argc, char** argv) {
         bool serialEligible = op == Operation::Gather
                                   ? bytes <= cfg.pushSerialMaxBytes
                                   : bytes <= cfg.rsPushSerialMaxBytes;
-        bool llEligible = op == Operation::Scatter && shard % 2 == 0 &&
-                          bytes <= cfg.rsLlMaxBytes;
-        bool fenceEligible = op == Operation::Scatter &&
+        bool llEligible = !cfg.graph && op == Operation::Scatter &&
+                          shard % 2 == 0 && bytes <= cfg.rsLlMaxBytes;
+        bool fenceEligible = !cfg.graph && op == Operation::Scatter &&
                              bytes <= cfg.rsFenceMaxBytes;
-        std::vector<Backend> backends{Backend::Peer};
+        std::vector<Backend> backends;
+        if (!cfg.graph) backends.push_back(Backend::Peer);
+        if (hierEligible) backends.push_back(Backend::ScatterHier);
+        if (ringEligible) backends.push_back(Backend::ScatterRing);
         if (pullEligible) backends.push_back(Backend::Pull);
         if (vecEligible) backends.push_back(Backend::PullVec);
+        if (gridEligible) backends.push_back(Backend::PushGrid);
+        if (miniEligible) backends.push_back(Backend::MiniHost);
+        if (hierLlEligible) backends.push_back(Backend::ScatterHierLL);
+        if (rsGridEligible) backends.push_back(Backend::ScatterGrid);
         if (serialEligible) backends.push_back(Backend::PushSerial);
         if (llEligible) backends.push_back(Backend::ScatterLL);
         if (fenceEligible) backends.push_back(Backend::ScatterFence);
@@ -972,12 +1578,12 @@ int main(int argc, char** argv) {
           fill(devices, op, shard, generation);
           for (auto backend : backends) {
             launch(devices, comms, op, backend, shard, router.get(),
-                   packetRouter.get());
+                   packetRouter.get(), miniHost.get());
             synchronize(devices);
             verify(devices, op, backend, shard, generation);
           }
         }
-        std::array<std::vector<double>, 9> samples;
+        std::array<std::vector<double>, 15> samples;
         for (int repeat = 0; repeat < cfg.repeats; ++repeat) {
           std::vector<Backend> order;
           if (pullEligible) {
@@ -1019,15 +1625,50 @@ int main(int argc, char** argv) {
             std::rotate(order.begin(), order.begin() + repeat % order.size(),
                         order.end());
           }
+          if (ringEligible) {
+            order.push_back(Backend::ScatterRing);
+            std::rotate(order.begin(), order.begin() + repeat % order.size(),
+                        order.end());
+          }
+          if (hierEligible) {
+            order.push_back(Backend::ScatterHier);
+            std::rotate(order.begin(), order.begin() + repeat % order.size(),
+                        order.end());
+          }
+          if (rsGridEligible) {
+            order.push_back(Backend::ScatterGrid);
+            std::rotate(order.begin(), order.begin() + repeat % order.size(),
+                        order.end());
+          }
+          if (hierLlEligible) {
+            order.push_back(Backend::ScatterHierLL);
+            std::rotate(order.begin(), order.begin() + repeat % order.size(),
+                        order.end());
+          }
+          if (miniEligible) {
+            order.push_back(Backend::MiniHost);
+            std::rotate(order.begin(), order.begin() + repeat % order.size(),
+                        order.end());
+          }
+          if (gridEligible) {
+            order.push_back(Backend::PushGrid);
+            std::rotate(order.begin(), order.begin() + repeat % order.size(),
+                        order.end());
+          }
+          if (cfg.graph) {
+            order = backends;
+            std::rotate(order.begin(), order.begin() + repeat % order.size(),
+                        order.end());
+          }
           for (auto backend : order)
             samples[static_cast<int>(backend)].push_back(
                 measure(devices, comms, op, backend, shard, cfg, repeat,
-                        router.get(), packetRouter.get()));
+                        router.get(), packetRouter.get(), miniHost.get()));
         }
         fill(devices, op, shard, 2);
         for (auto backend : backends) {
           launch(devices, comms, op, backend, shard, router.get(),
-                 packetRouter.get());
+                 packetRouter.get(), miniHost.get());
           synchronize(devices);
           verify(devices, op, backend, shard, 2);
         }
@@ -1038,37 +1679,21 @@ int main(int argc, char** argv) {
                       backendName(backend), median(run), *range.first,
                       *range.second);
         }
-        Backend best = Backend::Peer;
-        if (pullEligible && median(samples[static_cast<int>(Backend::Pull)]) <
-                                median(samples[static_cast<int>(best)]))
-          best = Backend::Pull;
-        if (vecEligible && median(samples[static_cast<int>(Backend::PullVec)]) <
-                               median(samples[static_cast<int>(best)]))
-          best = Backend::PullVec;
-        if (serialEligible &&
-            median(samples[static_cast<int>(Backend::PushSerial)]) <
-                median(samples[static_cast<int>(best)]))
-          best = Backend::PushSerial;
-        if (llEligible &&
-            median(samples[static_cast<int>(Backend::ScatterLL)]) <
-                median(samples[static_cast<int>(best)]))
-          best = Backend::ScatterLL;
-        if (fenceEligible &&
-            median(samples[static_cast<int>(Backend::ScatterFence)]) <
-                median(samples[static_cast<int>(best)]))
-          best = Backend::ScatterFence;
-        char const* selected =
-            best == Backend::Pull ? "pull"
-                : best == Backend::PullVec ? "pull-vec"
-                : best == Backend::PushSerial ? "push-serial"
-                : best == Backend::ScatterLL ? "scatter-ll"
-                : best == Backend::ScatterFence ? "scatter-fence"
-                : op == Operation::Scatter && directSelfReduce(bytes)
-                      ? "peer-noself"
-                : ((op == Operation::Gather && bytes <= kCompactGatherBytes) ||
-                   (op == Operation::Scatter && bytes <= kCompactScatterBytes))
-                      ? "peer-compact"
-                      : "peer";
+        Backend best = cfg.graph ? Backend::PushSerial : Backend::Peer;
+        for (auto backend : backends)
+          if (backend != Backend::Nccl &&
+              median(samples[static_cast<int>(backend)]) <
+                  median(samples[static_cast<int>(best)]))
+            best = backend;
+        char const* selected = backendName(best);
+        if (best == Backend::Peer)
+          selected =
+              op == Operation::Scatter && directSelfReduce(bytes)
+                  ? "peer-noself"
+              : ((op == Operation::Gather && bytes <= kCompactGatherBytes) ||
+                 (op == Operation::Scatter && bytes <= kCompactScatterBytes))
+                  ? "peer-compact"
+                  : "peer";
         std::printf("# selected,%s,%zu,%s\n", opName(op), bytes, selected);
         std::fflush(stdout);
       }
@@ -1079,4 +1704,5 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "peer AG/RS: %s\n", error.what());
     return 1;
   }
+  return 0;
 }

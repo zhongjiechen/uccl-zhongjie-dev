@@ -1,6 +1,17 @@
 # Four-GPU peer AllGather and ReduceScatter
 
-## Current four-L4 AllGather figure
+## November 13 full-range follow-up
+
+The [new full-size study](../benchmarks/data/small_medium_4l4_20261113/README.md)
+adds eager fused host AllGather (`mini-host`) for the medium range and a phased
+LL ReduceScatter hierarchy for 16–32 KiB. At 1 / 4 MiB AG takes 66.43 / 188.79 µs;
+at 32 KiB RS takes 19.47 µs. Complete curves now include 16 B–1 GiB, with every
+candidate, range and negative result retained. The separate prepared resident
+mode is input-ready and host-blocking; its timings must not be mixed into these
+eager GPU-event curves. The README links the current full-size tables.
+
+
+## Archived November 11 four-L4 AllGather figure
 
 The [owner-host FP32 paired sweep](../benchmarks/data/fp32_packet_ag_per_source_4l4_20261111/README.md)
 keeps `push-serial` at 1 KiB–2 MiB and the direct peer path at 4–8 MiB,

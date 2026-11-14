@@ -1,0 +1,28 @@
+{
+  "base_commit": "f7fdc9553bf89100aafe168c4a23b7426497dd1b",
+  "working_tree_modified": true,
+  "note": "Final source/binary identity. Individual earlier timing windows and excluded prototypes are recorded in README/STATUS; final monitored correctness and AG recheck validate promoted code.",
+  "sha256": {
+    "Makefile": "85e0fe8108606fd4a24e8c499b01edb5ddf99fb36b2124ed82dd07a6ab93289a",
+    "src/collectives/allreduce.cu": "efb00bd527dc2a53a5fe6bbbec31f956b83edf2c148fa125687adbce3a4c2292",
+    "src/collectives/peer_ag_rs.cu": "888e9c57db318448d40abd52d325a4e8bd8dd7d7e3c9bf9a3ec94484bcbf29cd",
+    "src/collectives/resident_collectives.cu": "5199bad5bccb1a6a2e1abe5a798f8dfa728a92ba7e419005cb0f2ffdaa9a44e7",
+    "src/collectives/peer_hybrid_allreduce.cu": "43adc74ffbc3914a8f87c9b72265271ce2df4a8ad992d30fa797144ee6cc29a1",
+    "tests/collectives/peer_small_medium_check.cu": "cebae8af506466a37e5c5a7010d5051b34ebf81f67ad6dfa829e059bce10db71",
+    "tests/collectives/resident_check.cu": "2563666477b1856f7a95e217f5c0a5c30cf622c27910d2c2ec716bc1d4d3408a",
+    "scripts/summarize_all_sizes_4l4.py": "468ecc75cfa31e007d260b1b1cd81ba03e51ebf4f68633ed6cac51974587e29d",
+    "scripts/run_idle_gpu_benchmark.py": "5c227610046555a5346f0e13019199e6b23276ba767d20e8a7b260651fd36e80",
+    "build/uccl_lite_allreduce": "61db7e190c07479364247851860d3075c4817cb0f7df14899787e51a0a36e7dd",
+    "build/uccl_lite_peer_ag_rs": "93b5921f712f17b8414ed3c71d30a0d2305fae04c28f82381cb92d80c86e7490",
+    "build/uccl_lite_peer_ag_rs_packet": "15c53a5a848e485d616acea912ae8f62e9850403c21671a7d3452e7e11daef79",
+    "build/uccl_lite_resident_collectives": "3952fc3865386983455a7d343f24a48ccacbb1bfac5891088d2703b74a5efa5d",
+    "build/uccl_lite_resident_check": "a362c68cd0c06bb6b0874775bcd4972d44922a09e00368fed0f56dcb517cac59",
+    "build/uccl_lite_peer_small_medium_check": "633080e992b3ba1bf65c58543dd4eebfa3ed0ac3b994dc590b643658a996fe28",
+    "build/uccl_lite_peer_ring_check": "46b005ec84e5197fe1eed1b9a16391ac5724ade4e1ca07e0ae1eeef943f2a132",
+    "build/uccl_lite_peer_hybrid_check": "7987ca901057354dc9f70fba1ef053d0cddc791c15a6867fc7e4895da3d02614",
+    "build/cpu_router/libuccl_lite_cpu_router.a": "c4298d1d258020a472fb0dd1df109c1e94e5ddbd9327d84468ee6ac9eadfefbd",
+    "/home/zhongjie/third_party/nccl/build/lib/libnccl.so.2": "ad951367f06580b8b4597ef97772a1eda6bf7c0162967bcfef7efdc127ac5449",
+    "/home/zhongjie/third_party/mscclpp/build/lib/libmscclpp.so": "453fe9d455d361887f6cc8fd8495550e573cb07e8a0428b520e17efb3f8ad87f"
+  },
+  "mini_kernel_matches_accepted_sweep": true
+}

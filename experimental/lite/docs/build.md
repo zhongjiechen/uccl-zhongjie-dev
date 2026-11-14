@@ -208,3 +208,57 @@ OUTPUT_LOG=build/moe-refresh.log bash scripts/run_moe_refresh.sh
 Keep output from each run and the exact binary/library hashes with the
 summary CSVs. The [refresh record](../benchmarks/data/refresh_20261110/README.md)
 contains the commands, raw logs, and timing boundaries used for the README.
+
+## November 13 four-L4 candidates
+
+```bash
+make peer_ag_rs peer-ring-check peer-hybrid-allreduce peer-hybrid-check
+./build/uccl_lite_peer_ring_check
+./build/uccl_lite_peer_hybrid_check
+./build/uccl_lite_peer_ag_rs --rs-only --rs-ring -b 1024 -e 1073741824 -w 10 -n 10 -r 3
+./build/uccl_lite_peer_hybrid_allreduce -b 16777216 -e 1073741824 -w 10 -n 10 -r 3
+./build/uccl_lite_peer_ag_rs --graph -b 1024 -e 1048576 -w 10 -n 10 -r 3
+```
+
+The ring RS and hybrid AR are opt-in standalone experiments. Hybrid AR is
+FP32 in-place, one process, GPU peer RS followed by mapped-host packet AG;
+it requires the optional CPU-router library. It does not support graph capture.
+`--rs-ring-chunk-bytes` sets RS piece size. `--packet-bytes` and `--packet-blocks`
+expose packet AG geometry without changing the router's default policy.
+The `--graph` peer harness supports SM pull/push-serial and NCCL through 1 MiB;
+CE peer copies and host-generation LL/fence candidates are excluded. Its timing
+is graph-versus-graph, separate from the eager README curves.
+Native AR `-a 8` selects only the existing ring for diagnostics; omitting `-a`
+retains the original candidate sweep. See the [complete execution record](../benchmarks/data/optimization_4l4_20261113/EXPERIMENTS.md).
+
+## Full-size and small/medium follow-up
+
+```bash
+make allreduce peer_ag_rs peer-ag-rs-packet peer-small-medium-check resident-collectives resident-check
+./build/uccl_lite_peer_small_medium_check
+./build/uccl_lite_resident_check
+./build/uccl_lite_allreduce --sm-variants --fast-sweep -b 1024 -e 1073741824 -w 5 -n 10
+./build/uccl_lite_peer_ag_rs_packet --packet-router-ag --packet-router-per-source \
+  --mini-host-max-bytes 16777216 --push-grid-blocks 16 -b 16 -e 1073741824 -w 20 -n 10 -r 3
+./build/uccl_lite_peer_ag_rs --rs-only --rs-ring --rs-hier-ll-max-bytes 32768 \
+  -b 16 -e 1073741824 -w 20 -n 10 -r 3
+./build/uccl_lite_resident_collectives -b 16 -e 1048576 -w 20 -n 20 -r 3
+```
+
+Native AR now waits for its input copy on the collective stream before timing;
+its reference changes generation every call and rejects nonfinite outputs.
+`--sm-variants` adds explicit 1-/8-CTA variants; `--fast-sweep` retains all
+eligible candidates through 4 MiB and only the established ring above it.
+`--sm-blocks` and `--allocation-bytes` are diagnostic overrides.
+
+Mini-host AG remains eager-only. Its prepared capacity must be a multiple of
+16 bytes and its block count a multiple of four. The phased LL RS candidate
+requires integral float2 shards and all-rank completion before scratch reuse.
+No automatic production routing policy was added.
+
+Resident mode is a separate input-ready, host-blocking experiment. It reserves
+one CTA per GPU; stop the workers before device-wide synchronization or cleanup.
+`--packets 0` is an ablation. `--nccl-graph 1` measures a global NCCL graph
+control; `--nccl-graph 2` uses per-device graphs. These options change only the
+reference control, not the resident execution contract. See the
+[full study and complete tables](../benchmarks/data/small_medium_4l4_20261113/README.md).
