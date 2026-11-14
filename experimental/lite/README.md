@@ -95,7 +95,8 @@ on the longer batch was only 0.3% in this sequential test.
 
 The latest four-L4 FP32 study covers **1 KiB–1 GiB for native AllReduce**,
 **16 B–1 GiB for AllGather/ReduceScatter**, and **16 B–1 MiB for all three in
-prepared resident mode**. Small, medium and large regions are shown separately.
+prepared resident mode**. Each ordinary collective has two panels: **1 KiB–1 MiB
+latency** and **1 MiB–1 GiB bus throughput**, matching the 8×L4 overview format.
 Sizes are full AR/RS input or AG output bytes per GPU.
 
 Ordinary AR uses four processes, in-place buffers and the maximum-rank host
@@ -104,19 +105,13 @@ out-of-place buffers and maximum-GPU eager CUDA events (20 warmups,
 3 rotated rounds × 10 calls). Each curve selects the lowest checked UCCL median
 per size; these are benchmark envelopes, not a portable runtime routing policy.
 NCCL 2.28.7 uses the same timing and placement as its paired candidate.
+The 1-MiB point appears in both panels. Bus throughput is `1.5 × bytes / time`
+for four-rank AR and `0.75 × bytes / time` for AG/RS, in decimal GB/s.
 [Methods, all candidates, correctness and negative results](benchmarks/data/small_medium_4l4_20261113/README.md).
-
-#### 1 KiB–1 MiB: every message size
-
-![Ordinary four-L4 AR, AG and RS latency at every power of two from 1 KiB through 1 MiB](docs/assets/collectives-4l4-1k-1m.svg)
-
-All 11 power-of-two sizes are shown. AR uses host timing; AG/RS use GPU events,
-so their timing scopes remain labeled separately. Complete numerical results
-and the full-range figures follow.
 
 #### AllReduce on single 4xL4 GPU
 
-![AllReduce across small, medium and large messages](docs/assets/collectives-4l4-allreduce-all-sizes.svg)
+![AllReduce: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput](docs/assets/collectives-4l4-allreduce-all-sizes.svg)
 
 The native hierarchy now has explicit 1-/8-CTA candidates. At 1 MiB the
 8-CTA path takes **122.96 µs** versus paired NCCL **140.73 µs**. The benchmark's
@@ -126,7 +121,7 @@ The separate large-message experimental hybrid still has its
 
 #### AllGather on single 4xL4 GPU
 
-![AllGather across small, medium and large messages](docs/assets/collectives-4l4-allgather-all-sizes.svg)
+![AllGather: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput](docs/assets/collectives-4l4-allgather-all-sizes.svg)
 
 The new fused `mini-host` candidate improves **1–16 MiB**. At 1 / 4 MiB it
 takes **66.43 / 188.79 µs**, versus prior UCCL candidates **72.82 / 241.38 µs**
@@ -135,7 +130,7 @@ per-source packet pipeline.
 
 #### ReduceScatter on single 4xL4 GPU
 
-![ReduceScatter across small, medium and large messages](docs/assets/collectives-4l4-reducescatter-all-sizes.svg)
+![ReduceScatter: 1 KiB–1 MiB latency and 1 MiB–1 GiB bus throughput](docs/assets/collectives-4l4-reducescatter-all-sizes.svg)
 
 The phased LL hierarchy improves the small-message region: **32 KiB takes
 19.47 µs**, versus paired NCCL **30.43 µs**. The fused single-CTA path remains
@@ -176,9 +171,9 @@ include the 16–512 B points. Small differences are not significance claims.
 
 #### Prepared resident mode for small and medium messages
 
-![Prepared resident AR, AG and RS latency at every power of two from 1 KiB through 1 MiB](docs/assets/collectives-4l4-resident-1k-1m.svg)
-
-The [full resident figure](docs/assets/collectives-4l4-resident-small-medium.svg) also includes 16–512 B.
+The resident-only [1 KiB–1 MiB plot](docs/assets/collectives-4l4-resident-1k-1m.svg)
+and [16 B–1 MiB plot](docs/assets/collectives-4l4-resident-small-medium.svg) are
+kept separately; this study has no 1 MiB–1 GiB throughput series.
 
 This explicit experiment reserves one CTA per GPU and uses a packed command
 word instead of per-call kernel launches. It is **input-ready and host-blocking**,

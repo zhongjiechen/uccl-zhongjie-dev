@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate complete paired sweeps and publish small/medium/large views."""
+"""Validate sweeps and plot paired latency/throughput panels like 8xL4."""
 import collections
 import csv
 import math
@@ -9,6 +9,8 @@ from statistics import mean, median
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+from figure_style import clean_axis, configure, save as save_figure
 
 root = Path(__file__).resolve().parents[1]
 data = root / 'benchmarks/data/small_medium_4l4_20261113'
@@ -72,39 +74,48 @@ for row in ar:
 assert [r['bytes'] for r in ar] == [1024<<i for i in range(21)]
 
 def plot(rows, name, timer, factor):
-    fig, axes = plt.subplots(1, 3, figsize=(14,4))
-    small = [r for r in rows if r['bytes'] <= 65536]
-    medium = [r for r in rows if 131072 <= r['bytes'] <= 16777216]
-    large = [r for r in rows if r['bytes'] >= 33554432]
-    for key, label in [('uccl_median_us','UCCL Lite selected'),('nccl_median_us','NCCL 2.28.7')]:
-        axes[0].plot([r['bytes']/1024 for r in small], [r[key] for r in small], 'o-', label=label)
-        axes[1].plot([r['bytes']/2**20 for r in medium], [r[key] for r in medium], 'o-', label=label)
-        axes[2].plot([r['bytes']/2**20 for r in large],
-                     [factor*r['bytes']/r[key]/1000 for r in large], 'o-', label=label)
-    for ax in axes:
-        ax.set_xscale('log', base=2); ax.grid(alpha=.3); ax.legend(fontsize=8)
-    axes[0].set(xlabel='Full tensor/GPU (KiB)', ylabel='Latency (µs)', title='Small')
-    axes[1].set(xlabel='Full tensor/GPU (MiB)', ylabel='Latency (µs)', title='Medium')
-    axes[1].set_yscale('log', base=2)
-    axes[2].set(xlabel='Full tensor/GPU (MiB)', ylabel='Bus bandwidth (GB/s)', title='Large')
-    fig.suptitle(f'4×L4 FP32 {name} · {timer} · median of 3 run means')
-    fig.tight_layout()
-    fig.savefig(root/f'docs/assets/collectives-4l4-{name.lower()}-all-sizes.svg')
-    fig.savefig(root/f'build/{name.lower()}-all-sizes.png', dpi=100)
-plot(ar, 'AllReduce', '4 processes, host timer', 1.5)
-plot(ag, 'AllGather', '1 process, eager GPU events', .75)
-plot(rs, 'ReduceScatter', '1 process, eager GPU events', .75)
-fig, axes = plt.subplots(1,3,figsize=(14,4))
-for ax, op, label in zip(axes, ['all_reduce','all_gather','reduce_scatter'], ['AllReduce','AllGather','ReduceScatter']):
-    rows = [r for r in resident if r['operation']==op]
-    for key, title in [('uccl_median_us','Prepared resident'),('nccl_median_us','NCCL 2.28.7')]:
-        ax.plot([r['bytes']/1024 for r in rows], [r[key] for r in rows], 'o-', label=title)
-    ax.set_xscale('log',base=2); ax.set_yscale('log',base=2)
-    ax.set(title=label,xlabel='Full tensor/GPU (KiB)',ylabel='Latency (µs)')
-    ax.grid(alpha=.3); ax.legend(fontsize=8)
-fig.suptitle('Experimental resident mode · input-ready, one-process host completion · preparation excluded')
-fig.tight_layout(); fig.savefig(root/'docs/assets/collectives-4l4-resident-small-medium.svg')
-fig.savefig(root/'build/resident-small-medium.png',dpi=100)
+    by_size = {row['bytes']: row for row in rows}
+    assert len(by_size) == len(rows), f'duplicate sizes: {name}'
+    latency_sizes = [1 << power for power in range(10, 21)]
+    throughput_sizes = [1 << power for power in range(20, 31)]
+    assert all(size in by_size for size in latency_sizes + throughput_sizes)
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.4))
+    fig.subplots_adjust(left=.085, right=.985, top=.77, bottom=.20, wspace=.28)
+    for ax, sizes, measure, ylabel, ticks in (
+        (axes[0], latency_sizes, lambda size, us: us, 'Latency (µs)',
+         [1 << power for power in (10, 12, 14, 16, 18, 20)]),
+        (axes[1], throughput_sizes, lambda size, us: factor * size / us / 1000,
+         'Bus throughput (GB/s)',
+         [1 << power for power in (20, 22, 24, 26, 28, 30)]),
+    ):
+        clean_axis(ax)
+        ax.set_xscale('log', base=2)
+        ax.set_xlim(sizes[0] / 1.35, sizes[-1] * 1.35)
+        ax.set_xticks(ticks, [size_name(size).replace(' KiB', 'K').replace(' MiB', 'M').replace(' GiB', 'G')
+                             for size in ticks])
+        ax.set_xlabel('Complete tensor bytes per rank')
+        ax.set_ylabel(ylabel)
+        upper = 0.0
+        for key, label, color, marker, style in (
+            ('nccl_median_us', 'NCCL 2.28.7', '#D65A00', 's', (0, (5, 2.5))),
+            ('uccl_median_us', 'UCCL Lite', '#0068B5', 'o', '-'),
+        ):
+            values = [measure(size, by_size[size][key]) for size in sizes]
+            assert len(values) == 11 and all(math.isfinite(v) and v > 0 for v in values)
+            upper = max(upper, *values)
+            ax.plot(sizes, values, color=color, linewidth=2.8, marker=marker,
+                    linestyle=style, markersize=6, markeredgecolor='white',
+                    markeredgewidth=.7, label=label)
+        ax.set_ylim(0, upper * 1.13)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles[::-1], labels[::-1], loc='upper center',
+               bbox_to_anchor=(.5, .995), ncol=2, frameon=False,
+               fontsize=12.5, handlelength=2.8, columnspacing=3, markerscale=1.2)
+    fig.text(.5, .865, f'4×L4 FP32 {name} · {timer}', ha='center', fontsize=10.5)
+    fig.text(.5, .035, 'K/M/G denote KiB/MiB/GiB · median of 3 run means · per-size UCCL selection',
+             ha='center', fontsize=9)
+    save_figure(fig, f'collectives-4l4-{name.lower()}-all-sizes', preview=True)
+
 
 def size_name(n):
     return f'{n//2**30} GiB' if n>=2**30 else f'{n//2**20} MiB' if n>=2**20 else f'{n//1024} KiB' if n>=1024 else f'{n} B'
@@ -125,41 +136,9 @@ print('AG medium improvements:')
 for row in ag:
     if row['bytes'] in [2**20,2**21,2**22,2**23,2**24]: print(row)
 
-# Focused views for the requested 1 KiB–1 MiB range. Keep execution contracts
-# in separate figures and retain all 11 sizes, including slower medians.
-def focus_plot(groups, filename, title, resident_mode=False):
-    from matplotlib.ticker import ScalarFormatter
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4.6))
-    sizes = [1024 << i for i in range(11)]
-    for ax, rows, label in zip(axes, groups, ['AllReduce', 'AllGather', 'ReduceScatter']):
-        rows = [r for r in rows if 1024 <= r['bytes'] <= 1048576]
-        assert [r['bytes'] for r in rows] == sizes
-        for key, series, style in [
-            ('uccl_median_us', 'Prepared resident' if resident_mode else 'UCCL Lite selected', 'o-'),
-            ('nccl_median_us', 'NCCL 2.28.7', 's--'),
-        ]:
-            ax.plot([r['bytes']/1024 for r in rows], [r[key] for r in rows],
-                    style, markersize=4, linewidth=1.7, label=series)
-        scope = '1 process · input-ready host timing' if resident_mode else (
-            '4 processes · host timing' if label == 'AllReduce' else '1 process · eager GPU events')
-        ax.set_title(label + '\n' + scope, fontsize=10)
-        ax.set_xscale('log', base=2); ax.set_yscale('log', base=2)
-        ax.set_xticks([n/1024 for n in sizes])
-        ax.set_xticklabels([str(n//1024) for n in sizes], rotation=45, ha='right', fontsize=8)
-        ax.yaxis.set_major_formatter(ScalarFormatter())
-        ax.set_xlabel('Full tensor/GPU (KiB; 1024 = 1 MiB)', fontsize=9)
-        ax.set_ylabel('Latency (µs)')
-        ax.grid(alpha=.25); ax.legend(fontsize=8, loc='upper left')
-    fig.suptitle(title, fontsize=12)
-    fig.text(.5, .01, 'FP32 · four NVIDIA L4 GPUs · median of three run means · all powers of two shown',
-             ha='center', fontsize=9)
-    fig.tight_layout(rect=(0, .035, 1, .94))
-    fig.savefig(root/'docs/assets'/filename)
-    fig.savefig(root/'build'/filename.replace('.svg', '.png'), dpi=120)
-
-focus_plot([ar, ag, rs], 'collectives-4l4-1k-1m.svg',
-           'UCCL Lite vs NCCL · ordinary calls · 1 KiB–1 MiB')
-focus_plot([[r for r in resident if r['operation']==op]
-            for op in ['all_reduce','all_gather','reduce_scatter']],
-           'collectives-4l4-resident-1k-1m.svg',
-           'Experimental prepared resident mode · 1 KiB–1 MiB · preparation excluded', True)
+# The README displays only these two-panel views. Older focused/resident SVGs
+# remain archived; resident timings do not cover the throughput range.
+configure()
+plot(ar, 'AllReduce', '4 processes, host timer', 1.5)
+plot(ag, 'AllGather', '1 process, eager GPU events', .75)
+plot(rs, 'ReduceScatter', '1 process, eager GPU events', .75)

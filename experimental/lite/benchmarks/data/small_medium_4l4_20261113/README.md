@@ -200,3 +200,12 @@ Publication also incorporates the upstream eight-GPU changes through
 this four-L4 study. Use the recorded source/library hashes for its performance
 provenance; compilation and integration checks of the combined revision are
 separate from these timing results.
+
+
+The README presentation now uses the 8×L4 overview style: exactly two panels
+per ordinary collective, latency over 1 KiB–1 MiB and normalized bus throughput
+over 1 MiB–1 GiB, including 1 MiB in both. Each series has eleven points.
+Four-rank normalization is 1.5 for AR and 0.75 for AG/RS, with decimal GB/s.
+The former combined focused figures and resident-only plots remain archived
+and linked separately; resident data are not extrapolated to 1 GiB. Replotting
+does not change any recorded timing or per-size selection.
