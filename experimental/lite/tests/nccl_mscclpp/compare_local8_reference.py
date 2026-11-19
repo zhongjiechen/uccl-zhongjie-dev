@@ -169,7 +169,7 @@ def main():
                     # The saved launcher revalidates the frozen identity on each rank.
                     command = ['mpirun', '--timeout', '1700', '-np', '8', '--bind-to', 'none',
                                '--map-by', 'slot', '--mca', 'pml', 'ob1', '--mca', 'btl', 'self,vader,tcp',
-                               'python3', '-B', str(candidate / 'mscclpp_profile.py'), 'launch',
+                               'python3', '-B', str(candidate / 'backend_profile.py'), 'launch',
                                '--local8', '--library', str(library),
                                '--real-nccl', str(ROOT / 'build/nccl-2.28.9/lib/libnccl.so.2'),
                                '--profile', str(candidate / 'candidate.tsv'), '--', str(client),

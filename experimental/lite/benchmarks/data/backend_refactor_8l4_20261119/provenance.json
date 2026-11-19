@@ -1,0 +1,61 @@
+{
+  "base_revision": "5c0be574",
+  "branch": "refactor/collective-backends",
+  "libraries": {
+    "baseline": {
+      "library_sha256": "a613c4f85541aaf39c5e08b4db2d12ee817b29942cbd0cb8dde423df0cb854c7",
+      "profile_sha256": "a95044b9b27037b903c6a6e15bb7050a35f523b687773b905f06cd14f8a41e82",
+      "host_identity": "7bd46ff6b5a399b84e4c4662a8151f8a101e192ffbbac7275b0740ec1390ef3c"
+    },
+    "candidate": {
+      "library_sha256": "ce862a6f0df10437c25c09eaf5859dd97c71c8cb81a42bfc93c3a0b144abe02b",
+      "profile_sha256": "a0f1ed0b7f440ea47ac44e794d961aadc52dc24b500b4814c4a5aac055e680d3",
+      "host_identity": "69ff41e036f138e8e714934c1ace7aa1e141e05839dc7f1ace7bb17e5a3a1e88"
+    }
+  },
+  "client_sha256": "2972a0ad177c2e1562b57c0001dce5e6b3aae0d9d5db1884802a1777eb39c410",
+  "network_library_sha256": "2134934dc459ae2488632243bc94cf2a8d75d02b82da79786d54b751b6f6e607",
+  "mscclpp_compile_revision": "52f659dac390c9820bdc4db0577faeffe61a7370",
+  "protocol": {
+    "warmups": 5,
+    "iterations": 10,
+    "repeats": 3,
+    "jobs_per_backend_layout": 2,
+    "layouts": [
+      "out",
+      "in"
+    ],
+    "sizes": [
+      1024,
+      2048,
+      4096,
+      8192,
+      16384,
+      32768,
+      65536,
+      131072,
+      262144,
+      524288,
+      1048576,
+      2097152,
+      4194304,
+      8388608,
+      16777216,
+      33554432,
+      67108864,
+      134217728,
+      268435456,
+      536870912,
+      1073741824
+    ],
+    "timed_calls": 15120,
+    "warmup_calls": 7560,
+    "timing": "input-ready maximum-rank per-call CUDA events; includes ABI staging, submission and stream completion",
+    "aggregation": "median of repetition medians, then median of two job medians",
+    "best_per_size": false,
+    "sample_trimming": false
+  },
+  "source_state": "Measured libraries were built from the refactor worktree; source hashes and snapshots identify that worktree independently of the base Git revision.",
+  "network_runtime": "not run: second four-L4 host 10.10.55.1 unreachable",
+  "common_frontend_object_sha256": "c6c0ebd9fc875f8d5d1259056df031a78ccf58825b81b1a962700e48fdca760e"
+}

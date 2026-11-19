@@ -1,7 +1,7 @@
 // NCCL ABI interposition for calibrated, single-node BF16 packet collectives.
 // The real NCCL is also a DT_NEEDED dependency: unwrapped API symbols retain
 // their implementation when this library is loaded through ctypes/dlopen.
-#include "uccl_lite/multiprocess_collectives.h"
+#include "uccl_lite/backends/local.h"
 #include <algorithm>
 #include <array>
 #include <cmath>

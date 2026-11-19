@@ -1,3 +1,10 @@
+The code now follows the [shared frontend/backend organization](../../docs/backends.md).
+The qualification below describes the archived pre-refactor library; source
+reorganization does not extend that historical runtime qualification.
+The [refactor report](../../benchmarks/data/backend_refactor_8l4_20261119/README.md)
+records a complete network-backend build; a new two-host runtime check remains
+unverified because the second host was unreachable.
+
 > Qualified on the recorded **two hosts × four L4 GPUs**, FP32, eager,
 > one GPU/process, 1 KiB–1 GiB powers of two, both layouts: **126/126 aligned
 > comparison points have no measured regression versus the original README
@@ -55,8 +62,8 @@ compatibility base and rejected experiments remain available for reproduction.
 MSCCL++ supplies `NativeAlgorithm`, `AlgorithmCollection`, stable context
 caching, `TcpBootstrap`, `Communicator`, registration, `MemoryChannel`,
 `PortChannel`, semaphores, `LL16Packet` and the IB proxy. UCCL Lite supplies the GPU collective
-algorithms from `src/multinode/device_collectives.cuh` and the NCCL-compatible
-API in `mscclpp_strict.cc`. No MSCCL++ dependency source is vendored or modified.
+algorithms from `src/backends/multinode/device_collectives.cuh` and the NCCL-compatible
+API in `nccl_abi.cc`. No MSCCL++ dependency source is vendored or modified.
 The tested external source revision is 52f659d, with an existing local
 `gpu_utils.cc` modification recorded by the library hashes.
 
@@ -114,7 +121,7 @@ returns an explicit unsupported error.
 ## Build and validate strict correctness
 
 Use the Makefile and external dependencies at identical paths on both hosts.
-The default `UCCL_LITE_NCCL_POLICY=graph512` in [policy.mk](policy.mk) selects the
+The default `UCCL_LITE_NCCL_POLICY=graph512` in [policy.mk](../../src/backends/multinode/policy.mk) selects the
 qualified configuration. The ordinary target builds the strict replacement and
 its `libnccl.so.2` loader alias; no extra optimization flags are required.
 

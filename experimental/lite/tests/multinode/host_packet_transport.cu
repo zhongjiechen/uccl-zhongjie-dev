@@ -1,4 +1,4 @@
-#include "../../src/multinode/host_packet_transport.h"
+#include "../../src/backends/multinode/host_packet_transport.h"
 #include <chrono>
 #include <cstdio>
 #include <thread>

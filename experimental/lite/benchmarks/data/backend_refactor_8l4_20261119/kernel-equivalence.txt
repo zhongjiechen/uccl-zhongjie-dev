@@ -1,0 +1,1 @@
+PASS: 11 local CUDA kernels have identical SASS after normalizing filename-derived anonymous-namespace names.

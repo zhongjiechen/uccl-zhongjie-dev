@@ -20,7 +20,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'integration/nccl_lite'))
-import mscclpp_profile
+import backend_profile
 
 
 def checked(log, operation, routed):
@@ -122,7 +122,7 @@ def main():
     if re.search(r'libnccl\.so', dependencies):
         raise RuntimeError('strict candidate depends on native NCCL')
     (out / 'dependencies.txt').write_text(dependencies)
-    for name in ['mscclpp_profile.py', 'dropin_profile.py']:
+    for name in ['backend_profile.py', 'dropin_profile.py']:
         shutil.copy2(ROOT / 'integration/nccl_lite' / name, out / name)
     operations = [('all_gather', 1), ('reduce_scatter', 2), ('all_reduce', 3)]
     for op, _ in operations:
@@ -150,7 +150,7 @@ def main():
         for key in exported:
             command += ['-x', key]
         return command
-    launcher = ['python3', '-B', str(out / 'mscclpp_profile.py')]
+    launcher = ['python3', '-B', str(out / 'backend_profile.py')]
     options = ['--library', str(library), '--real-nccl', str(real), '--strict']
     records = []
     for i, host in enumerate(hosts):
@@ -168,7 +168,7 @@ def main():
         p.error('strict testing requires all three operations at every tested size')
     (out / 'shapes.json').write_text(json.dumps(shapes, indent=2) + '\n')
     profile = out / 'candidate.tsv'
-    mscclpp_profile.write_candidate(profile, records, shapes, strict=True)
+    backend_profile.write_candidate(profile, records, shapes, strict=True)
     subprocess.run(['rsync', '-a', str(profile), f'{hosts[1]}:{out}/'], check=True)
     prefix = mpi(','.join(h + ':4' for h in hosts), 8, 'ppr:4:node')
     manifest = {'scope': 'strict UCCL-only candidate; native NCCL absent from candidate processes',

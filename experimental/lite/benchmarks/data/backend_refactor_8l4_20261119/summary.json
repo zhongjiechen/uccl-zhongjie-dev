@@ -1,0 +1,23 @@
+{
+  "ar": {
+    "points": 42,
+    "median_ratio": 1.0025437255363419,
+    "geomean_ratio": 1.0070568726182634,
+    "worst_ratio": 1.0731707334501415,
+    "over_5_percent": 2
+  },
+  "ag": {
+    "points": 42,
+    "median_ratio": 0.998947185532205,
+    "geomean_ratio": 0.9901386755070001,
+    "worst_ratio": 1.0108063224541166,
+    "over_5_percent": 0
+  },
+  "rs": {
+    "points": 42,
+    "median_ratio": 0.9998445273601626,
+    "geomean_ratio": 0.9988576441860766,
+    "worst_ratio": 1.0376194403618706,
+    "over_5_percent": 0
+  }
+}

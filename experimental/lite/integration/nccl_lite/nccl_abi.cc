@@ -1,10 +1,7 @@
 // Strict NCCL ABI compatibility: no native NCCL dependency or fallback.
 #include "host_control.h"
-#ifdef UCCL_LITE_NCCL_LOCAL8
-#include "local_strict.h"
-#else
-#include "uccl_lite/collectives.h"
-#endif
+#include "uccl_lite/backend.h"
+#include "uccl_lite/runtime/profile.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -15,29 +12,25 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <string>
+#include <vector>
 #include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <unistd.h>
 
 namespace {
-#ifdef UCCL_LITE_NCCL_LOCAL8
-using Backend = uccl_lite::nccl_detail::LocalCollectives;
-using BackendOperation = int;
-using BackendId = Backend::Id;
-constexpr int kHosts = 1, kLocalRanks = 8, kElementBytes = 2;
-constexpr ncclDataType_t kDtype = ncclBfloat16;
-constexpr char kProfileMagic[] = "UCCL_LITE_LOCAL8_STRICT_V1";
-#else
-using Backend = uccl_lite::NetworkCollectives;
-using BackendOperation = uccl_lite::NetworkOperation;
-using BackendId = uccl_lite::NetworkId;
-constexpr int kHosts = 2, kLocalRanks = 4, kElementBytes = 4;
-constexpr ncclDataType_t kDtype = ncclFloat32;
-constexpr char kProfileMagic[] = "UCCL_LITE_MSCCLPP_STRICT_V1";
-#endif
-size_t extentScale(int op) { return kElementBytes * (op == 3 ? 1 : 8); }
+using uccl_lite::backendCapabilities;
+using uccl_lite::BackendId;
+using uccl_lite::CollectiveOperation;
+size_t extentScale(int op) {
+  return backendCapabilities().extentScale(
+      static_cast<CollectiveOperation>(op));
+}
+ncclDataType_t backendDtype() {
+  return backendCapabilities().dtype == uccl_lite::ScalarType::Bfloat16
+             ? ncclBfloat16
+             : ncclFloat32;
+}
 thread_local std::string lastError;
 thread_local int groupDepth = 0;
 std::atomic<bool> live{false};
@@ -58,11 +51,6 @@ bool nativeLoaded() {
   }
   return false;
 }
-uint64_t hash(std::string const& data) {
-  uint64_t value = 14695981039346656037ULL;
-  for (unsigned char c : data) value = (value ^ c) * 1099511628211ULL;
-  return value;
-}
 std::string uuid(int device) {
   cudaDeviceProp property{};
   if (cudaGetDeviceProperties(&property, device) != cudaSuccess) return {};
@@ -72,66 +60,25 @@ std::string uuid(int device) {
                   static_cast<unsigned char>(property.uuid.bytes[i]));
   return text;
 }
-struct Policy {
-  std::map<std::pair<int, size_t>, bool> shapes;
-  std::array<std::string, kHosts> hosts, identities;
-  std::array<std::string, 8> uuids;
-  uint64_t digest = 0;
-  size_t capacity = 0;
-  int node = -1;
-};
+using Policy = uccl_lite::runtime::BackendProfile;
 Policy const& policy() {
   static Policy p = [] {
-    Policy result;
     auto path = std::getenv("UCCL_LITE_MSCCLPP_PROFILE");
     auto verified = std::getenv("UCCL_LITE_MSCCLPP_IDENTITY");
     auto candidate = std::getenv("UCCL_LITE_MSCCLPP_CANDIDATE");
-    // No implicit performance admission. This build accepts only explicit
-    // candidate experiments with freshly matched topology/software identity.
     if (!path || !verified || !candidate || std::strcmp(candidate, "1"))
-      return result;
+      return Policy{};
     std::ifstream file(path);
+    if (!file) return Policy{};
     std::string data((std::istreambuf_iterator<char>(file)), {});
-    std::istringstream input(data);
-    std::string magic;
-    if (!(input >> magic) || magic != kProfileMagic) return Policy{};
     char hostname[256]{};
     gethostname(hostname, sizeof(hostname) - 1);
-    int driver = 0, runtime = 0, nccl = 0;
+    int driver = 0, runtime = 0;
     cudaDriverGetVersion(&driver);
     cudaRuntimeGetVersion(&runtime);
-    nccl = NCCL_VERSION_CODE;
-    for (int n = 0; n < kHosts; ++n) {
-      int d, r, v;
-      if (!(input >> result.hosts[n] >> result.identities[n] >> d >> r >> v))
-        return Policy{};
-      for (int i = 0; i < kLocalRanks; ++i)
-        if (!(input >> result.uuids[kLocalRanks * n + i])) return Policy{};
-      if (result.hosts[n] == hostname && result.identities[n] == verified &&
-          driver == d && runtime == r && nccl == v)
-        result.node = n;
-    }
-    if ((kHosts == 2 && result.hosts.front() == result.hosts.back()) ||
-        result.node < 0)
-      return Policy{};
-    std::string line;
-    std::getline(input, line);
-    while (std::getline(input, line)) {
-      if (line.empty()) continue;
-      std::istringstream row(line);
-      int op;
-      size_t count;
-      std::string extra;
-      if (!(row >> op >> count) || row >> extra || op < 1 || op > 3 || !count)
-        return Policy{};
-      size_t scale = extentScale(op);
-      if (count > (1UL << 30) / scale || (count * scale) % 128 ||
-          !result.shapes.emplace(std::make_pair(op, count), true).second)
-        return Policy{};
-      result.capacity = std::max(result.capacity, count * scale);
-    }
-    result.digest = hash(data);
-    return result;
+    return uccl_lite::runtime::parseBackendProfile(
+        data, {hostname, verified, driver, runtime, NCCL_VERSION_CODE},
+        backendCapabilities());
   }();
   return p;
 }
@@ -143,7 +90,7 @@ struct ncclComm {
   bool finalized = false;
   ncclResult_t error = ncclSuccess;
   std::mutex mutex;
-  std::unique_ptr<Backend> transport;
+  std::unique_ptr<uccl_lite::CollectiveBackend> transport;
   std::map<std::pair<int, size_t>, uint64_t> counts;
 };
 
@@ -171,7 +118,7 @@ char const* ncclGetLastError(ncclComm_t) { return lastError.c_str(); }
 ncclResult_t ncclGetUniqueId(ncclUniqueId* id) {
   if (!id) return ncclInvalidArgument;
   try {
-    auto bytes = Backend::createUniqueId();
+    auto bytes = uccl_lite::createBackendId();
     static_assert(sizeof(*id) == sizeof(bytes));
     std::memcpy(id, bytes.data(), bytes.size());
     return ncclSuccess;
@@ -181,8 +128,9 @@ ncclResult_t ncclGetUniqueId(ncclUniqueId* id) {
 }
 ncclResult_t ncclCommInitRank(ncclComm_t* output, int ranks, ncclUniqueId id,
                               int rank) {
-  if (!output || ranks != 8 || rank < 0 || rank >= ranks)
-    return fail("requires eight ranks, one GPU per process",
+  if (!output || ranks != backendCapabilities().ranks() || rank < 0 ||
+      rank >= ranks)
+    return fail("rank count must match the backend, one GPU per process",
                 ncclInvalidArgument);
   *output = nullptr;
   if (nativeLoaded()) return fail("native NCCL library is loaded");
@@ -197,22 +145,25 @@ ncclResult_t ncclCommInitRank(ncclComm_t* output, int ranks, ncclUniqueId id,
       uint64_t digest;
       int valid, node, device, pid;
     };
-    Vote local{
-        p.digest,
-        int(!p.shapes.empty() && p.node == rank / kLocalRanks &&
-            device == rank % kLocalRanks && uuid(device) == p.uuids[rank]),
-        p.node, device, int(getpid())};
-    std::array<Vote, 8> votes{};
+    Vote local{p.digest,
+               int(!p.shapes.empty() &&
+                   p.node == rank / backendCapabilities().ranksPerHost &&
+                   device == rank % backendCapabilities().ranksPerHost &&
+                   uuid(device) == p.uuids[rank]),
+               p.node, device, int(getpid())};
+    std::vector<Vote> votes(ranks);
     uccl_lite::nccl_detail::HostControl control(
         std::getenv("UCCL_LITE_MSCCLPP_CONTROL_ROOT"), &id, sizeof(id), rank,
         ranks);
     control.allGather(&local, votes.data(), sizeof(local));
     for (int i = 0; i < ranks; ++i) {
       if (!votes[i].valid || votes[i].digest != local.digest ||
-          votes[i].node != i / kLocalRanks ||
-          votes[i].device != i % kLocalRanks)
+          votes[i].node != i / backendCapabilities().ranksPerHost ||
+          votes[i].device != i % backendCapabilities().ranksPerHost)
         throw std::runtime_error("profile/topology consensus failed");
-      for (int j = i / kLocalRanks * kLocalRanks; j < i; ++j)
+      for (int j = i / backendCapabilities().ranksPerHost *
+                   backendCapabilities().ranksPerHost;
+           j < i; ++j)
         if (votes[i].pid == votes[j].pid)
           throw std::runtime_error("multiple ranks per process");
     }
@@ -222,7 +173,7 @@ ncclResult_t ncclCommInitRank(ncclComm_t* output, int ranks, ncclUniqueId id,
     BackendId bytes{};
     std::memcpy(bytes.data(), &id, sizeof(id));
     comm->transport =
-        std::make_unique<Backend>(bytes, rank, device, device / 2, p.capacity);
+        uccl_lite::createBackend({bytes, rank, device, p.capacity});
     *output = comm.release();
     std::fprintf(stderr, "UCCL Lite strict: rank=%d native_nccl_loaded=0\n",
                  rank);
@@ -246,7 +197,7 @@ ncclResult_t ncclCommGetAsyncError(ncclComm_t comm, ncclResult_t* error) {
 }
 ncclResult_t ncclCommCount(ncclComm_t comm, int* count) {
   if (!comm || !count) return ncclInvalidArgument;
-  *count = 8;
+  *count = backendCapabilities().ranks();
   return ncclSuccess;
 }
 ncclResult_t ncclCommUserRank(ncclComm_t comm, int* rank) {
@@ -349,7 +300,7 @@ ncclResult_t invoke(ncclComm_t comm, int op, void const* input, void* output,
   if (!comm || comm->finalized) return ncclInvalidArgument;
   if (!count) return ncclSuccess;
   if (groupDepth) return fail("grouped collectives unsupported");
-  if (dtype != kDtype || (op != 1 && reduction != ncclSum) ||
+  if (dtype != backendDtype() || (op != 1 && reduction != ncclSum) ||
       !policy().shapes.count({op, count}))
     return fail(
         "collective dtype/reduction/extent is outside the strict profile");
@@ -361,8 +312,8 @@ ncclResult_t invoke(ncclComm_t comm, int op, void const* input, void* output,
   std::lock_guard<std::mutex> guard(comm->mutex);
   try {
     if (!comm->transport->initialized()) comm->transport->prepare();
-    comm->transport->enqueue(static_cast<BackendOperation>(op), input, output,
-                             count, stream);
+    comm->transport->enqueue(static_cast<CollectiveOperation>(op), input,
+                             output, count, stream);
     ++comm->counts[{op, count * extentScale(op)}];
     return ncclSuccess;
   } catch (std::exception const& error) {

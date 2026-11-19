@@ -285,6 +285,7 @@ The `Process (CPU)` operators can be used in different collectives:
 - [Build targets and correctness commands](docs/build.md)
 - [Hardware profiler methods and measurements](docs/hardware-profiler.md)
 - [Collective algorithms](docs/collectives.md) and [two-node design](docs/multinode.md)
+- [Shared runtime and collective backend organization](docs/backends.md)
 - [Fusion design and workloads](docs/fusion.md)
 - [NCCL drop-in and SGLang integration](integration/nccl_lite/README.md)
 - [Strict eight-L4 NCCL `.so` replacement and nccl-tests validation](integration/nccl_lite/LOCAL8.md)

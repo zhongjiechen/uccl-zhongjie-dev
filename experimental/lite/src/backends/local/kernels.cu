@@ -1,4 +1,4 @@
-#include "uccl_lite/multiprocess_packet_ag.h"
+#include "packet_layout.cuh"
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

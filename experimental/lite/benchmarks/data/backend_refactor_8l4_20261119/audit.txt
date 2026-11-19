@@ -1,0 +1,1 @@
+PASS: 24 paired jobs, 126 points recomputed from full checked samples; 12 nccl-tests sweeps; exact routes, zero fallback, runtime affinity, frozen library/profile/client identities and ABI/queue summaries verified.

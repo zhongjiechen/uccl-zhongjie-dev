@@ -25,7 +25,7 @@ from run import checked, checked_strict
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'integration/nccl_lite'))
-import mscclpp_profile
+import backend_profile
 import dropin_profile
 
 
@@ -68,7 +68,7 @@ def main():
     shutil.copy2(args.library, library)
     (out / 'strict').mkdir()
     (out / 'strict/libnccl.so.2').symlink_to('../' + library.name)
-    for name in ('mscclpp_profile.py', 'dropin_profile.py'):
+    for name in ('backend_profile.py', 'dropin_profile.py'):
         shutil.copy2(ROOT / 'integration/nccl_lite' / name, out / name)
     shutil.copy2(__file__, out / 'validation_driver.py')
     shutil.copy2(Path(__file__).with_name('local8_process.py'), out / 'local8_process.py')
@@ -92,8 +92,8 @@ def main():
     env.update(NCCL_NET='Socket', NCCL_NET_PLUGIN='none', NCCL_PROFILER_PLUGIN='none',
                NCCL_IB_DISABLE='1', UCCL_LITE_MSCCLPP_CONTROL_ROOT='127.0.0.1',
                LD_LIBRARY_PATH=str(real.parent) + ':/usr/local/cuda-12.9/lib64')
-    env.update(mscclpp_profile.local_packet_environment())
-    launcher = [sys.executable, '-B', str(out / 'mscclpp_profile.py')]
+    env.update(backend_profile.local_packet_environment())
+    launcher = [sys.executable, '-B', str(out / 'backend_profile.py')]
     options = ['--local8', '--library', str(library), '--real-nccl', str(real)]
     value = subprocess.check_output(launcher + ['probe', *options], env=env, text=True)
     record = json.loads(value)
@@ -101,7 +101,7 @@ def main():
     sizes = [1 << power for power in range(10, args.max_bytes.bit_length())]
     shapes = [(op, size // (2 if op == 3 else 16)) for _, op in operations for size in sizes]
     profile = out / 'candidate.tsv'
-    mscclpp_profile.write_candidate(profile, [record], shapes, local8=True)
+    backend_profile.write_candidate(profile, [record], shapes, local8=True)
     prefix = [args.mpirun, '--timeout', str(args.timeout), '-np', '8',
               '--bind-to', 'none', '--map-by', 'slot', '--mca', 'pml', 'ob1',
               '--mca', 'btl', 'self,vader,tcp']

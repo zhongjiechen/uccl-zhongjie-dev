@@ -2,7 +2,8 @@
 #ifdef UCCL_LITE_HOST_GATHER_EXPERIMENT
 #include "async_host_gather.cuh"
 #endif
-#include "uccl_lite/collectives.h"
+#include "uccl_lite/backends/multinode.h"
+#include "uccl_lite/runtime/cuda.h"
 #if defined(UCCL_LITE_GRAPH_BINDING_CACHE) ||  \
     defined(UCCL_LITE_SYNC_PRIMARY_CONTEXT) || \
     defined(UCCL_LITE_DRIVER_COMPLETION) ||    \
@@ -31,8 +32,7 @@
 namespace uccl_lite {
 namespace {
 void checked(cudaError_t result) {
-  if (result != cudaSuccess)
-    throw std::runtime_error(cudaGetErrorString(result));
+  runtime::checkCuda(result);
 }
 using namespace multinode_kernels;
 #ifdef UCCL_LITE_RS_MEDIUM_BYTES

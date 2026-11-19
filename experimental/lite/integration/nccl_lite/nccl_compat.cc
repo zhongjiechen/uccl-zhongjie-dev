@@ -1,4 +1,4 @@
-#include "uccl_lite/multiprocess_collectives.h"
+#include "uccl_lite/backends/local.h"
 #include "nccl_fusion.h"
 
 #include <nccl.h>

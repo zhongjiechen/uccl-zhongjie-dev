@@ -89,12 +89,12 @@ RS alone was only 0.3%.
 
 The proxy maps NCCL communicators by unique ID and rank; NCCL still handles
 initialization and unsupported operations. Its original data path in
-`../../src/collectives/multiprocess_collectives.cc` uses
+`../../src/backends/local/transport.cc` uses
 whole-tensor GPU/host copies and a CPU callback. It is the fallback when the
 packet mode below is disabled.
 
 The experimental packet path in
-`../../src/collectives/multiprocess_packet_ag.cu` uses two
+`../../src/backends/local/kernels.cu` uses two
 shared, mapped host packet slots and system-scope generation signals. Each
 process launches transport on its own GPU stream. AG uses separate GPU upload
 and download crews for outputs of at least 512 KiB. RS uses a GPU path for

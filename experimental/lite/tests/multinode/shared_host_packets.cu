@@ -1,4 +1,4 @@
-#include "../../src/multinode/shared_host_packets.h"
+#include "../../src/backends/multinode/shared_host_packets.h"
 #include <cstdio>
 #include <vector>
 #include <mpi.h>

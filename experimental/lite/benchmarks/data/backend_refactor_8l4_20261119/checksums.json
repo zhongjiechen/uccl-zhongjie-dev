@@ -1,0 +1,15 @@
+{
+  "comparison.csv": "65c63af5a043305517585043a184c76e6d7bad3ea190fd37cf40017bddd1b6fc",
+  "kernel-equivalence.txt": "2a86d993683ef31a799dfdaa5b9ea76632c544bc291f93b413f81f9bb16e0d05",
+  ".gitignore": "f0ff2d773100cc3df85b266f2f0220e6c3886db1b0ccdfb70ffac15d2ccaef31",
+  "raw_checksums.json": "e605006ef8f7b06c860a93bc255b3ec30a5bc021102e3bc949bf9ef075542716",
+  "audit.txt": "862963bb19613d290f7a60fa3d38e571549eb07e98f8f391f4fdcdbf77df2e30",
+  "summary.json": "5e91a4232fb1ce2539c847aecebd73cdbf85b2873802c035b9c71ebfbb9c8384",
+  "measurements.tar.gz": "aa45b0c3d64ecaf3f4564045cadea6aa51fca296aa5fa59b6fec29a8c51447bf",
+  "README.md": "f5bdecaf69aaa29de7ba49435e7d4d49f93f04786a0d004a2d9a3844166c1f00",
+  "native_comparison.json": "a8e2b8829c539b3a8995a4be5bd233dc0582a61883c874e1680b3769f747238a",
+  "validation.json": "f1ac8558cc73304a41e2351abc22375131ef9fd1d241c87209c9371ba7665d6d",
+  "provenance.json": "f6af09da7a820553eee848d1b0901170e5291ab0d4e73e767dd7de83e1ac286b",
+  "hardware.json": "a2793e7ebe1dadb5d4d6bd66d9362378785940f5e45d5a88dac9e6d1904d2690",
+  "source_hashes.json": "e0449eb415b8146fcd2f55ffa1cecd6b8d28503b5bca9cf4218849701756cd92"
+}

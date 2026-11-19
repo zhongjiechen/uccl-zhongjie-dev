@@ -1,9 +1,15 @@
 # Strict NCCL ABI replacement on eight L4 GPUs
 
-This is the single-host BF16 port of the [strict multi-node adapter](MSCCLPP.md).
-It shares `mscclpp_strict.cc`, `host_control.h`, the identity launcher, the
+This is the single-host BF16 backend of the shared NCCL adapter.
+See [backend organization](../../docs/backends.md) for the common interface and
+[two-host backend](MSCCLPP.md) for the network build.
+It shares `nccl_abi.cc`, `host_control.h`, the identity launcher, the
 version script, the ABI stress client and the nccl-tests route auditor. The
 local backend uses UCCL Lite's existing multiprocess packet transport.
+
+The [backend refactor report](../../benchmarks/data/backend_refactor_8l4_20261119/README.md)
+records fresh correctness checks and performance against the preserved `.so`.
+The earlier qualification below remains tied to its archived library hash.
 
 `make nccl-local8-strict` builds
 `build/nccl_local8/libuccl_lite_nccl_local8.so`, with SONAME `libnccl.so.2` and

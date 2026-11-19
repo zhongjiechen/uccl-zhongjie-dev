@@ -59,12 +59,12 @@
     }                                                                         \
   } while (0)
 
-#include "../multinode/device_collectives.cuh"
+#include "../backends/multinode/device_collectives.cuh"
 using namespace uccl_lite::multinode_kernels;
 
 __global__ void nullKernel() {}
 
-#include "../multinode/oneshot_allreduce.cuh"
+#include "../backends/multinode/oneshot_allreduce.cuh"
 
 struct Config {
   bool arOneShot = false;

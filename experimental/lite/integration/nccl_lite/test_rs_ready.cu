@@ -1,4 +1,4 @@
-#include "uccl_lite/multiprocess_collectives.h"
+#include "uccl_lite/backends/local.h"
 
 #include <cuda_bf16.h>
 #include <sys/wait.h>

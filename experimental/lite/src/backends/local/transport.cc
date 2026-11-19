@@ -1,6 +1,6 @@
-#include "uccl_lite/multiprocess_collectives.h"
+#include "uccl_lite/backends/local.h"
 #include "uccl_lite/cpu_router/cpu_executor.hpp"
-#include "uccl_lite/multiprocess_packet_ag.h"
+#include "packet_layout.cuh"
 #include <linux/mempolicy.h>
 #include <algorithm>
 #include <array>

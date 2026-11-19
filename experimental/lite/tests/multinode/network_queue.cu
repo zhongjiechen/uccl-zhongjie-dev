@@ -1,4 +1,4 @@
-#include "uccl_lite/collectives.h"
+#include "uccl_lite/backends/multinode.h"
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>

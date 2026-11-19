@@ -1,0 +1,84 @@
+{
+  "profile_checks": 57,
+  "nccl_tests_full_sweeps": 12,
+  "abi_calls_per_rank": 234,
+  "communicator_lifetimes": 2,
+  "queued_calls_per_rank": 128,
+  "negative_cases": [
+    "dtype",
+    "product",
+    "group",
+    "capture",
+    "missing_profile"
+  ],
+  "direct_loader_alias_sweeps": 3,
+  "paired_jobs": 24,
+  "paired_points": 126,
+  "identical_local_sass_kernels": 11,
+  "identical_exported_abi": true,
+  "local_native_nccl_or_mscclpp_dependency": false,
+  "core": [
+    {
+      "name": "policy",
+      "command": [
+        "/home/wxzheng/uccl-zhongjie-dev/experimental/lite/build/backend_refactor_20261119/core/uccl_lite_router_policy_check"
+      ],
+      "returncode": 0
+    },
+    {
+      "name": "dispatcher",
+      "command": [
+        "/home/wxzheng/uccl-zhongjie-dev/experimental/lite/build/backend_refactor_20261119/core/uccl_lite_dispatcher_check"
+      ],
+      "returncode": 0
+    },
+    {
+      "name": "dispatcher_cuda",
+      "command": [
+        "/home/wxzheng/uccl-zhongjie-dev/experimental/lite/build/backend_refactor_20261119/core/uccl_lite_dispatcher_cuda_check"
+      ],
+      "returncode": 0
+    },
+    {
+      "name": "eager4",
+      "command": [
+        "/home/wxzheng/uccl-zhongjie-dev/experimental/lite/build/backend_refactor_20261119/core/uccl_lite_router_check",
+        "--devices",
+        "0,1,4,5"
+      ],
+      "returncode": 0
+    },
+    {
+      "name": "graph4",
+      "command": [
+        "/home/wxzheng/uccl-zhongjie-dev/experimental/lite/build/backend_refactor_20261119/core/uccl_lite_router_graph_check",
+        "--devices",
+        "0,1,4,5",
+        "--gpu-progress"
+      ],
+      "returncode": 0
+    },
+    {
+      "name": "eager8",
+      "command": [
+        "/home/wxzheng/uccl-zhongjie-dev/experimental/lite/build/backend_refactor_20261119/core/uccl_lite_router_check",
+        "--devices",
+        "0,1,2,3,4,5,6,7"
+      ],
+      "returncode": 0
+    },
+    {
+      "name": "graph8",
+      "command": [
+        "/home/wxzheng/uccl-zhongjie-dev/experimental/lite/build/backend_refactor_20261119/core/uccl_lite_router_graph_check",
+        "--devices",
+        "0,1,2,3,4,5,6,7",
+        "--gpu-progress"
+      ],
+      "returncode": 0
+    }
+  ],
+  "network_and_standalone_compile": true,
+  "network_two_host_runtime": false,
+  "legacy_libraries_compile": true
+}
