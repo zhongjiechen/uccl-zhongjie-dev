@@ -115,4 +115,4 @@ calls and two communicator lifetimes. `backend-profile-check` covers all three
 profile contracts. Historical four-L4 timing qualification does not transfer
 to this refactored binary; new correctness evidence is recorded separately.
 
-See the [four-L4 refactor validation record](../benchmarks/data/backend_refactor_4l4_20261120/README.md) for current single-node/two-node results and the remaining full-size memory constraint.
+See the [four-L4 refactor validation record](../benchmarks/data/backend_refactor_4l4_20261120/README.md) for the completed single-node and two-node correctness results through 1 GiB.
