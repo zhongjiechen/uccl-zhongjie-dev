@@ -37,8 +37,16 @@ int main() {
                               4,
                               1UL << 30,
                               128};
+  BackendCapabilities local4{"local4",
+                             "UCCL_LITE_MSCCLPP_LOCAL_STRICT_V1",
+                             1,
+                             4,
+                             ScalarType::Float32,
+                             4,
+                             1UL << 30,
+                             128};
   int checks = 0;
-  for (auto const& caps : {local, network}) {
+  for (auto const& caps : {local, network, local4}) {
     std::ostringstream shapes;
     for (int op = 1; op <= 3; ++op)
       for (int power = 10; power <= 30; ++power)
@@ -56,7 +64,8 @@ int main() {
       };
       auto profile = parse(valid);
       assert(profile.node == node && profile.shapes.size() == 63);
-      assert(profile.capacity == (1UL << 30) && profile.uuids.size() == 8);
+      assert(profile.capacity == (1UL << 30) &&
+             profile.uuids.size() == size_t(caps.ranks()));
       assert(profile.digest == parse(valid).digest);
       ++checks;
       for (auto const& invalid :
@@ -79,9 +88,11 @@ int main() {
         assert(parseBackendProfile(valid, stale, caps).shapes.empty());
         ++checks;
       }
-      auto other = caps.hosts == 1 ? network : local;
-      assert(parseBackendProfile(valid, identity, other).shapes.empty());
-      ++checks;
+      for (auto const& other : {local, network, local4}) {
+        if (std::string(other.name) == caps.name) continue;
+        assert(parseBackendProfile(valid, identity, other).shapes.empty());
+        ++checks;
+      }
     }
   }
   std::cout << "PASS backend profile contract: " << checks << " checks\n";

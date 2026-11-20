@@ -20,6 +20,12 @@ constexpr auto kType = ncclFloat;
 constexpr int kLocalRanks = 4;
 #endif
 
+#ifdef UCCL_LITE_ABI_LOCAL
+constexpr int kRanks = 4;
+#else
+constexpr int kRanks = 8;
+#endif
+
 void check(cudaError_t result) {
   if (result != cudaSuccess)
     throw std::runtime_error(cudaGetErrorString(result));
@@ -47,8 +53,9 @@ int main(int argc, char** argv) {
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &world);
   try {
-    if (world != 8)
-      throw std::runtime_error("requires eight ranks on the profiled topology");
+    if (world != kRanks)
+      throw std::runtime_error(
+          "requires the configured ranks on the profiled topology");
     check(cudaSetDevice(rank % kLocalRanks));
     cudaStream_t streams[2];
     for (auto& s : streams)
@@ -102,9 +109,9 @@ int main(int argc, char** argv) {
 #endif
                              8388608UL}) {
           for (int op = 1; op <= 3; ++op) {
-            size_t count = bytes / (sizeof(Element) * (op == 3 ? 1 : 8));
-            size_t ni = count * (op == 2 ? 8 : 1);
-            size_t no = count * (op == 1 ? 8 : 1);
+            size_t count = bytes / (sizeof(Element) * (op == 3 ? 1 : kRanks));
+            size_t ni = count * (op == 2 ? kRanks : 1);
+            size_t no = count * (op == 1 ? kRanks : 1);
             bool inplace = (rank + generation) % 2;
             size_t sourceOffset = inplace && op == 1 ? rank * count : 0;
             size_t targetOffset = inplace && op == 2 ? rank * count : 0;
@@ -167,7 +174,7 @@ int main(int argc, char** argv) {
                   expected = value(index % count, index / count, generation);
                 else {
                   expected = 0;
-                  for (int peer = 0; peer < 8; ++peer)
+                  for (int peer = 0; peer < kRanks; ++peer)
                     expected += value(op == 2 ? rank * count + index : index,
                                       peer, generation);
                 }

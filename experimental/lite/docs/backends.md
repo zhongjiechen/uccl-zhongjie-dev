@@ -1,6 +1,6 @@
 # Collective backend organization
 
-Both NCCL libraries use the same frontend and profile parser. Each build links
+All three NCCL libraries use the same frontend and profile parser. Each build links
 one backend factory; it does not select a backend merely from the GPU count.
 The existing exact topology/software/shape profile remains mandatory.
 
@@ -10,11 +10,12 @@ The existing exact topology/software/shape profile remains mandatory.
 | Bootstrap/launcher | `integration/nccl_lite/host_control.h`, `backend_profile.py` | Rank consensus and verified runtime identity |
 | Backend contract | `include/uccl_lite/backend.h` | Capabilities, construction, prepare, enqueue, completion and teardown |
 | Shared runtime | `src/runtime/`, `include/uccl_lite/runtime/` | Backend-independent profile parsing and CUDA error utilities |
-| Local backend | `src/backends/local/` | Eight-L4 BF16 host-packet transport, CPU workers and GPU kernels |
+| Four-L4 backend | `src/backends/local4/` | Single-host FP32 CUDA IPC, packet, GPU ring and host-copy schedules |
+| Eight-L4 backend | `src/backends/local/` | Eight-L4 BF16 host-packet transport, CPU workers and GPU kernels |
 | Multinode backend | `src/backends/multinode/` | Two four-L4 FP32 hosts, local GPU channels, MSCCL++/RDMA and host-packet pipelines |
 
 The frontend is compiled once into `build/runtime/nccl_abi.o` and linked into
-both libraries without backend-specific preprocessor definitions. It obtains
+all three libraries without backend-specific preprocessor definitions. It obtains
 host count, ranks per host, dtype, element width, profile format and extent
 limits from `backendCapabilities()`. Backend selection happens at link time:
 each backend supplies `backendCapabilities()`, `createBackendId()` and
@@ -54,6 +55,7 @@ for source compatibility, with no duplicate implementation.
 ## Build and verification
 
 ```bash
+make nccl-local4      # build/nccl_local/libuccl_lite_nccl_local_strict.so
 make nccl-local       # build/nccl_local8/libuccl_lite_nccl_local8.so
 make nccl-multinode   # build/nccl_lite/libuccl_lite_nccl_strict.so
 make backend-profile-check
@@ -78,3 +80,39 @@ No best-per-size variant or sample trimming is used.
 Historical qualification reports remain tied to their archived library and
 source hashes. Refactor validation is recorded separately from those reports.
 See the [eight-L4 refactor measurements and build checks](../benchmarks/data/backend_refactor_8l4_20261119/README.md).
+
+## Four-L4 backend
+
+`local4` adapts the retained four-process FP32 implementation to
+`CollectiveBackend`; the shared NCCL frontend is unchanged. Its class and
+operation names no longer masquerade as the network backend. Construction stays
+CPU-only, and preparation, caller-stream completion, cached internal graphs and
+transport retirement remain owned by the backend. `policy.mk` retains the
+`four-l4-fp32` size policy. This is explicit profile admission, not automatic
+routing based on GPU count. Positive-count application graph capture remains
+unsupported; zero-count capture is accepted by the common frontend.
+
+The `nccl-local-strict` target and `build/nccl_local/strict/libnccl.so.2` loader
+alias are retained. The local profile magic is distinct from both other
+backends. The launcher accepts one four-L4 host for FP32, two four-L4 hosts for
+network FP32, or explicit `--local8` for eight-L4 BF16. CPU placement helpers
+support the retained `core2` placement and fingerprint their own sources.
+
+Run the checked stock-client sweep (external nccl-tests binaries are required):
+
+```bash
+make nccl-local4 build/nccl_local/strict_abi_check MPICXX=/path/to/mpicxx
+python3 -B tests/nccl_mscclpp/local.py \
+  --library build/nccl_local/libuccl_lite_nccl_local_strict.so \
+  --real-nccl /path/to/native/libnccl.so.2 --tests /path/to/nccl-tests/build \
+  --mpirun /path/to/mpirun --cpu-placement core2 \
+  --max-bytes 1073741824 --unalign 1 --out build/local4-stock
+```
+
+Use a new output directory and add `--abi build/nccl_local/strict_abi_check`
+for changing buffers/streams, delayed ranks, mixed layouts, guards, unsupported
+calls and two communicator lifetimes. `backend-profile-check` covers all three
+profile contracts. Historical four-L4 timing qualification does not transfer
+to this refactored binary; new correctness evidence is recorded separately.
+
+See the [four-L4 refactor validation record](../benchmarks/data/backend_refactor_4l4_20261120/README.md) for current single-node/two-node results and the remaining full-size memory constraint.

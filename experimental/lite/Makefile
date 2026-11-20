@@ -376,3 +376,5 @@ $(BUILD)/nccl_lite/layout_queue_check: tests/nccl_mscclpp/layout_queue.cu $(BUIL
 # Explicit per-call comparison including internal retirement; no native link.
 $(BUILD)/nccl_lite/reference_timing_check: tests/nccl_mscclpp/reference_timing.cu $(BUILD)/nccl_lite/strict/libnccl.so.2
 	$(NVCC) $(NVCC_FLAGS) -std=c++17 $(MPI_INC) -I$(NCCL_HOME)/include $< -o $@ $(MPI_LIB) -L$(BUILD)/nccl_lite -l:libuccl_lite_nccl_strict.so -Xlinker -rpath=$(abspath $(BUILD)/nccl_lite/strict)
+
+include src/backends/local4/module.mk
