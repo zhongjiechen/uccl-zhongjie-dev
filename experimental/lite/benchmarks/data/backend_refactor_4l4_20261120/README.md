@@ -19,7 +19,8 @@ Completed checks:
 - 80 shared profile checks (including cross-backend rejection); 14 CPU-placement
   checks; clang-format 14 and `git diff --check` pass.
 - Single-node stock nccl-tests: AR/AG/RS, FP32 SUM, 1 KiB–1 GiB, both layouts,
-  one-float misalignment, 126 size/layout cases, numerical errors zero.
+  aligned and one-float misalignment, 126 size/layout cases per sweep,
+  numerical errors zero.
 - Single-node ABI: 198 calls/rank, two lifetimes, full output/guards, changing
   pointers/streams, mixed layouts, delayed ranks, unsupported calls.
 - Two-node stock nccl-tests: AR/AG/RS, FP32 SUM, both layouts,
@@ -42,7 +43,9 @@ The memory constraint subsequently cleared. Fresh full 1-GiB local and
 two-node campaigns both pass on the same recorded libraries, including
 misalignment and exact route assertions; the two-node rejection and ABI checks
 also pass again. Their records are `validation_local4_1g` and
-`validation_network_1g` in the archive. The earlier OOM is retained as a
+`validation_network_1g` in the archive. A subsequent aligned single-node
+sweep (`validation_local4_1g_aligned`) also passes all 126 cases against the
+same library hash, closing the aligned/misaligned coverage matrix. The earlier OOM is retained as a
 resource failure, not a correctness pass.
 The 256-MiB local and network campaigns have completed successfully, as has
 ABI confirmation against the final formatted local build. The local ABI audit

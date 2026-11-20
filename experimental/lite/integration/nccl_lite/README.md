@@ -1,5 +1,12 @@
 # UCCL Lite NCCL AG/RS/AR compatibility layer
 
+For the **strict single-host four-L4 FP32 replacement**, use
+`make nccl-local4` and the [backend build and launch instructions](../../docs/backends.md#four-l4-backend).
+The shared NCCL frontend requires an exact runtime profile and forbids native
+NCCL fallback. Aligned and misaligned AR/AG/RS correctness checks pass through
+1 GiB; see the [refactor validation record](../../benchmarks/data/backend_refactor_4l4_20261120/README.md).
+These results do not establish a new performance qualification.
+
 For the **strict single-host eight-L4 BF16 replacement**, use
 [LOCAL8.md](LOCAL8.md) and `make nccl-local8-strict`. It shares the multi-node
 ABI/control infrastructure, forbids native NCCL fallback, and runs unchanged

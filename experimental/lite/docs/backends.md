@@ -68,8 +68,9 @@ the results. `strict` still means no native NCCL fallback, not another backend.
 The former `mscclpp_profile.py` launcher name is a symlink to
 `backend_profile.py`, preserving older commands and launcher-content hashes.
 
-`tests/nccl_mscclpp/strict_abi.cu` exercises both builds. Local tests and full
-unchanged nccl-tests runs use `run_local8.py`; two-host runs use `run.py`.
+`tests/nccl_mscclpp/strict_abi.cu` exercises all three builds. Unchanged
+nccl-tests runs use `local.py` for four L4s, `run_local8.py` for eight L4s,
+and `run.py` for two hosts.
 `compare_local8_backends.py` freezes two libraries and compares the same checked
 eight-rank per-call workload in reversed backend order. Each layout/size uses
 two jobs, each with three repetitions of five warmups and ten timed calls;
